@@ -1,16 +1,18 @@
 """
 run_simulation.py
 
-直接執行腳本（不需要 Jupyter）。
-產出：
-  1. Phase 1: 價格走勢 + Volume Profile + 支撐阻力
-  2. Phase 2: 自動型態偵測標記
-  3. Phase 3: Occupation Time 分佈
-  4. 對比：GBM vs. OrderBook vs. 純白噪音
+執行完整模擬實驗，產出 5 張圖：
+  phase1 : 價格走勢 + Volume Profile + 支撐阻力
+  phase2 : 自動型態偵測
+  phase3 : Occupation Time
+  phase4 : GBM vs OrderBook vs MultiAgent 三方對比
+  phase5 : smart_money_ratio 敏感度分析（0.0 / 0.3 / 0.7 / 0.95）
 
 用法：
     python scripts/run_simulation.py
-    python scripts/run_simulation.py --mode gbm --steps 50000 --seed 42
+    python scripts/run_simulation.py --mode multiagent --steps 100000 --seed 42
+    python scripts/run_simulation.py --smart-ratio 0.5 --no-show
+    python scripts/run_simulation.py --no-show --output-dir results/
 """
 
 import argparse
@@ -21,8 +23,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-# 讓 src/ 可被 import
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from market_simulator import MarketSimulator, SimConfig
 from pattern_visualizer import PatternVisualizerAuto
@@ -33,185 +34,276 @@ from utils import (
     detect_sr_levels,
 )
 
+DARK_BG = "#0d0d0d"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Random Market Simulator')
-    parser.add_argument('--mode',  default='orderbook', choices=['gbm', 'orderbook'])
-    parser.add_argument('--steps', type=int, default=100_000)
-    parser.add_argument('--seed',  type=int, default=None)
-    parser.add_argument('--bar-size', type=int, default=100,
-                        help='Ticks per OHLCV bar')
-    parser.add_argument('--no-show', action='store_true',
-                        help='Save figures instead of displaying')
+    parser = argparse.ArgumentParser(description="Random Market Simulator")
+    parser.add_argument("--mode",  default="multiagent",
+                        choices=["gbm", "orderbook", "multiagent"])
+    parser.add_argument("--steps", type=int, default=100_000)
+    parser.add_argument("--seed",  type=int, default=None)
+    parser.add_argument("--smart-ratio", type=float, default=0.3,
+                        help="Smart money ratio (0~1). Only used in multiagent mode.")
+    parser.add_argument("--bar-size", type=int, default=100,
+                        help="Ticks per OHLCV bar.")
+    parser.add_argument("--no-show", action="store_true",
+                        help="Save figures instead of displaying.")
+    parser.add_argument("--output-dir", default=".",
+                        help="Directory to save figures when --no-show is set.")
     return parser.parse_args()
 
 
-def phase1_price_and_profile(price_data: np.ndarray, save: bool = False) -> None:
-    """Phase 1：價格走勢 + Volume Profile + 支撐阻力"""
-    fig = plt.figure(figsize=(18, 7))
+def save_or_show(fig: plt.Figure, name: str, output_dir: str, save: bool) -> None:
+    if save:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / f"{name}.png"
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"  Saved: {path}")
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+def dark_fig(*args, **kwargs) -> tuple:
+    plt.style.use("dark_background")
+    fig = plt.figure(*args, **kwargs)
+    fig.patch.set_facecolor(DARK_BG)
+    return fig
+
+
+def dark_ax(ax: plt.Axes) -> plt.Axes:
+    ax.set_facecolor(DARK_BG)
+    return ax
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 1: 價格走勢 + Volume Profile
+# ──────────────────────────────────────────────────────────────────────
+
+def phase1(price_data: np.ndarray, save: bool, output_dir: str) -> None:
+    fig = dark_fig(figsize=(18, 7))
     gs = gridspec.GridSpec(1, 4, figure=fig)
-    ax_price   = fig.add_subplot(gs[0, :3])
-    ax_profile = fig.add_subplot(gs[0, 3])
-
-    plt.style.use('dark_background')
-    fig.patch.set_facecolor('#0d0d0d')
-    for ax in [ax_price, ax_profile]:
-        ax.set_facecolor('#0d0d0d')
-
-    plot_volume_profile(price_data, ax_price, ax_profile, bins=50, highlight_sr=True)
-    fig.suptitle(
-        'Phase 1: Random Walk Price Action & Liquidity Walls',
-        fontsize=14, color='white', y=1.01
-    )
+    ax_p = dark_ax(fig.add_subplot(gs[0, :3]))
+    ax_v = dark_ax(fig.add_subplot(gs[0, 3]))
+    plot_volume_profile(price_data, ax_p, ax_v, bins=50, highlight_sr=True)
+    fig.suptitle("Phase 1: Price Action & Liquidity Walls",
+                 fontsize=14, color="white", y=1.01)
     plt.tight_layout()
-    if save:
-        plt.savefig('phase1.png', dpi=150, bbox_inches='tight')
-        print('Saved: phase1.png')
-    else:
-        plt.show()
-    plt.close()
+    save_or_show(fig, "phase1", output_dir, save)
 
 
-def phase2_pattern_detection(price_data: np.ndarray, save: bool = False) -> None:
-    """Phase 2：自動偵測型態（頭肩頂、雙底、趨勢線）"""
-    plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(18, 7))
-    fig.patch.set_facecolor('#0d0d0d')
-    ax.set_facecolor('#0d0d0d')
+# ──────────────────────────────────────────────────────────────────────
+# Phase 2: 自動型態偵測
+# ──────────────────────────────────────────────────────────────────────
 
+def phase2(price_data: np.ndarray, save: bool, output_dir: str) -> None:
+    fig = dark_fig(figsize=(18, 7))
+    ax = dark_ax(fig.add_subplot(111))
     viz = PatternVisualizerAuto(price_data, order=40)
-    viz.plot_base_chart(ax, color='white', label='Random Price', subsample=5)
+    viz.plot_base_chart(ax, color="white", label="Random Price", subsample=5)
     detected = viz.find_and_draw_patterns(ax, max_patterns=6)
-
-    ax.set_title('Phase 2: Auto-Detected Patterns on Random Data', fontsize=14, color='white')
-    ax.set_ylabel('Price')
+    ax.set_title("Phase 2: Auto-Detected Patterns on Random Data",
+                 fontsize=14, color="white")
     ax.grid(True, alpha=0.1)
-    ax.legend(loc='upper right', frameon=True, facecolor='#1a1a1a', fontsize=8)
-
-    proof_text = (
-        f'RESULT:\n'
-        f'  Detected {len(detected)} patterns on pure random data.\n'
-        f'  Patterns emerge from local extrema geometry,\n'
-        f'  not from market intelligence.'
+    ax.legend(loc="upper right", frameon=True, facecolor="#1a1a1a", fontsize=8)
+    proof = (
+        f"RESULT:\n"
+        f"  {len(detected)} patterns detected on pure random data.\n"
+        f"  Geometry emerges from local extrema — not market intelligence."
     )
-    props = dict(boxstyle='round', facecolor='#3d0000', alpha=0.6, edgecolor='red')
-    ax.text(0.02, 0.05, proof_text, transform=ax.transAxes, fontsize=9,
-            verticalalignment='bottom', color='white', bbox=props)
-
+    ax.text(0.02, 0.05, proof, transform=ax.transAxes, fontsize=9,
+            va="bottom", color="white",
+            bbox=dict(boxstyle="round", facecolor="#3d0000", alpha=0.6, edgecolor="red"))
     plt.tight_layout()
-    if save:
-        plt.savefig('phase2.png', dpi=150, bbox_inches='tight')
-        print('Saved: phase2.png')
-    else:
-        plt.show()
-    plt.close()
+    save_or_show(fig, "phase2", output_dir, save)
 
 
-def phase3_occupation_time(price_data: np.ndarray, save: bool = False) -> None:
-    """Phase 3：Occupation Time — 支撐阻力天然形成的統計根源"""
-    plt.style.use('dark_background')
+# ──────────────────────────────────────────────────────────────────────
+# Phase 3: Occupation Time
+# ──────────────────────────────────────────────────────────────────────
+
+def phase3(price_data: np.ndarray, save: bool, output_dir: str) -> None:
     df = compute_occupation_time(price_data, bins=100)
+    fig = dark_fig(figsize=(16, 6))
+    axes = [dark_ax(fig.add_subplot(1, 2, i + 1)) for i in range(2)]
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    fig.patch.set_facecolor('#0d0d0d')
-    for ax in axes:
-        ax.set_facecolor('#0d0d0d')
-
-    # 左：水平條形圖（Occupation Time vs. Price Level）
-    axes[0].barh(df['price_level'], df['occupation_time'],
-                 height=(df['price_level'].max() - df['price_level'].min()) / 100,
-                 color='orange', alpha=0.6)
-    axes[0].set_xlabel('Occupation Time (ticks)', color='white')
-    axes[0].set_ylabel('Price Level', color='white')
-    axes[0].set_title('Occupation Time Distribution\n(why S/R levels emerge)', color='white')
+    price_range = df["price_level"].max() - df["price_level"].min()
+    axes[0].barh(df["price_level"], df["occupation_time"],
+                 height=price_range / 100, color="orange", alpha=0.6)
+    axes[0].set_xlabel("Occupation Time (ticks)", color="white")
+    axes[0].set_ylabel("Price Level", color="white")
+    axes[0].set_title("Occupation Time Distribution", color="white")
     axes[0].grid(alpha=0.1)
 
-    # 右：標記 S/R 在價格走勢上的位置
-    sr_levels = detect_sr_levels(price_data)
-    axes[1].plot(price_data[::10], color='cyan', lw=0.5, alpha=0.8)
-    for lvl in sr_levels:
-        axes[1].axhline(lvl, color='red', lw=0.6, alpha=0.5, linestyle='--')
-    axes[1].set_title(f'S/R Levels from Occupation Time\n({len(sr_levels)} levels detected)', color='white')
+    sr = detect_sr_levels(price_data)
+    axes[1].plot(price_data[::10], color="cyan", lw=0.5, alpha=0.8)
+    for lvl in sr:
+        axes[1].axhline(lvl, color="red", lw=0.6, alpha=0.5, linestyle="--")
+    axes[1].set_title(f"S/R from Occupation Time ({len(sr)} levels)", color="white")
     axes[1].grid(alpha=0.1)
 
-    fig.suptitle('Phase 3: Statistical Origin of Support/Resistance', fontsize=13, color='white')
+    fig.suptitle("Phase 3: Statistical Origin of Support/Resistance",
+                 fontsize=13, color="white")
     plt.tight_layout()
-    if save:
-        plt.savefig('phase3.png', dpi=150, bbox_inches='tight')
-        print('Saved: phase3.png')
-    else:
-        plt.show()
-    plt.close()
+    save_or_show(fig, "phase3", output_dir, save)
 
 
-def phase4_comparison(price_data: np.ndarray, steps: int, save: bool = False) -> None:
-    """Phase 4：三種隨機過程對比（GBM / OrderBook / Pure Random Walk）"""
-    plt.style.use('dark_background')
+# ──────────────────────────────────────────────────────────────────────
+# Phase 4: 三種模型對比
+# ──────────────────────────────────────────────────────────────────────
 
-    gbm_sim   = MarketSimulator(mode='gbm',       config=SimConfig(steps=steps, sigma=0.002))
-    ob_sim    = MarketSimulator(mode='orderbook', config=SimConfig(steps=steps))
-    gbm_data  = gbm_sim.run()
-    ob_data   = ob_sim.run()
-    rw_data   = random_walk_baseline(steps)
+def phase4(steps: int, seed, save: bool, output_dir: str) -> None:
+    gbm_data = MarketSimulator(
+        mode="gbm", config=SimConfig(steps=steps, sigma=0.0004, seed=seed)
+    ).run()
+    ob_data = MarketSimulator(
+        mode="orderbook", config=SimConfig(steps=steps, sigma=0.0004, seed=seed)
+    ).run()
+    ma_data = MarketSimulator(
+        mode="multiagent", config=SimConfig(steps=steps, seed=seed)
+    ).run()
+    rw_data = random_walk_baseline(steps)
 
-    fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=False)
-    fig.patch.set_facecolor('#0d0d0d')
+    fig = dark_fig(figsize=(18, 14))
     datasets = [
-        (rw_data,  'Pure Random Walk (White Noise Cumsum)', 'grey'),
-        (gbm_data, 'GBM (Geometric Brownian Motion)',       'cyan'),
-        (ob_data,  'OrderBook Simulation',                  'orange'),
+        (rw_data,  "Pure Random Walk (White Noise Cumsum)",  "grey"),
+        (gbm_data, "GBM (Geometric Brownian Motion)",        "cyan"),
+        (ob_data,  "OrderBook Simulation",                   "dodgerblue"),
+        (ma_data,  "MultiAgent (Noise Trader + Smart Money + MM)", "orange"),
     ]
-    for ax, (data, title, color) in zip(axes, datasets):
-        ax.set_facecolor('#0d0d0d')
+    for idx, (data, title, color) in enumerate(datasets):
+        ax = dark_ax(fig.add_subplot(4, 1, idx + 1))
         ax.plot(data, color=color, lw=0.6, alpha=0.9)
-        sr = detect_sr_levels(data)
-        for lvl in sr:
-            ax.axhline(lvl, color='red', lw=0.5, alpha=0.4, linestyle='--')
-        ax.set_title(title, color='white', fontsize=11)
+        for lvl in detect_sr_levels(data):
+            ax.axhline(lvl, color="red", lw=0.5, alpha=0.4, linestyle="--")
+        ax.set_title(title, color="white", fontsize=11)
         ax.grid(alpha=0.1)
 
-    fig.suptitle('Phase 4: Three Random Processes — All Produce Similar Patterns',
-                 fontsize=13, color='white')
+    fig.suptitle("Phase 4: Four Models — All Produce Visually Similar Patterns",
+                 fontsize=13, color="white")
     plt.tight_layout()
-    if save:
-        plt.savefig('phase4.png', dpi=150, bbox_inches='tight')
-        print('Saved: phase4.png')
-    else:
-        plt.show()
-    plt.close()
+    save_or_show(fig, "phase4", output_dir, save)
 
+
+# ──────────────────────────────────────────────────────────────────────
+# Phase 5: smart_money_ratio 敏感度分析（新增）
+# ──────────────────────────────────────────────────────────────────────
+
+def phase5(steps: int, seed, save: bool, output_dir: str) -> None:
+    """
+    固定其他參數，只改變 smart_money_ratio，
+    觀察市場結構如何隨大戶比例改變。
+    """
+    ratios = [0.0, 0.3, 0.7, 0.95]
+    labels = [
+        "0.0  — 全散戶，純噪音",
+        "0.3  — 接近現實（大戶少但影響大）",
+        "0.7  — 大戶主導，明顯 mean-reversion",
+        "0.95 — 近乎機構市場，極度平滑",
+    ]
+    colors = ["red", "orange", "cyan", "lime"]
+
+    fig = dark_fig(figsize=(18, 16))
+
+    for idx, (ratio, label, color) in enumerate(zip(ratios, labels, colors)):
+        cfg = SimConfig(
+            steps=steps,
+            seed=seed,
+            smart_money_ratio=ratio,
+        )
+        data = MarketSimulator(mode="multiagent", config=cfg).run()
+
+        ax_price   = dark_ax(fig.add_subplot(4, 4, idx * 4 + 1))
+        ax_profile = dark_ax(fig.add_subplot(4, 4, idx * 4 + 2))
+        ax_hist    = dark_ax(fig.add_subplot(4, 4, idx * 4 + 3))
+        ax_occ     = dark_ax(fig.add_subplot(4, 4, idx * 4 + 4))
+
+        # 價格走勢
+        ax_price.plot(data, color=color, lw=0.5, alpha=0.9)
+        for lvl in detect_sr_levels(data):
+            ax_price.axhline(lvl, color="red", lw=0.5, alpha=0.3, linestyle="--")
+        ax_price.set_title(f"smart_ratio={ratio}\n{label}",
+                           color="white", fontsize=8)
+        ax_price.grid(alpha=0.08)
+
+        # Volume Profile
+        import seaborn as sns
+        sns.histplot(y=data, bins=40, color=color, alpha=0.4,
+                     ax=ax_profile, kde=True)
+        ax_profile.set_title("Volume Profile", color="white", fontsize=8)
+        ax_profile.grid(alpha=0.08)
+        ax_profile.set_ylabel("")
+
+        # 回報分佈（fat tail 觀察）
+        returns = np.diff(data) / data[:-1]
+        ax_hist.hist(returns, bins=80, color=color, alpha=0.6, density=True)
+        ax_hist.set_title("Return Dist.", color="white", fontsize=8)
+        ax_hist.set_xlim(-0.02, 0.02)
+        ax_hist.grid(alpha=0.08)
+
+        # Occupation Time
+        df_occ = compute_occupation_time(data, bins=60)
+        price_range = df_occ["price_level"].max() - df_occ["price_level"].min()
+        ax_occ.barh(df_occ["price_level"], df_occ["occupation_time"],
+                    height=price_range / 60, color=color, alpha=0.5)
+        ax_occ.set_title("Occupation Time", color="white", fontsize=8)
+        ax_occ.grid(alpha=0.08)
+
+    fig.suptitle(
+        "Phase 5: smart_money_ratio Sensitivity\n"
+        "(Price Action | Volume Profile | Return Dist. | Occupation Time)",
+        fontsize=13, color="white",
+    )
+    plt.tight_layout()
+    save_or_show(fig, "phase5", output_dir, save)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     args = parse_args()
-
-    print(f'Running simulation: mode={args.mode}, steps={args.steps:,}, seed={args.seed}')
+    print(f"Mode: {args.mode} | Steps: {args.steps:,} | Seed: {args.seed} "
+          f"| smart_ratio: {args.smart_ratio}")
 
     cfg = SimConfig(
         steps=args.steps,
         seed=args.seed,
+        smart_money_ratio=args.smart_ratio,
     )
     sim = MarketSimulator(mode=args.mode, config=cfg)
-    GLOBAL_PRICE_DATA = sim.run()
+    data = sim.run()
 
-    print(f'Generated {len(GLOBAL_PRICE_DATA):,} ticks. '
-          f'Price range: {GLOBAL_PRICE_DATA.min():.2f} - {GLOBAL_PRICE_DATA.max():.2f}')
+    print(f"  {len(data):,} ticks generated. "
+          f"Range: {data.min():.2f} — {data.max():.2f}")
 
     save = args.no_show
+    out  = args.output_dir
 
-    print('\n[Phase 1] Price Action + Volume Profile...')
-    phase1_price_and_profile(GLOBAL_PRICE_DATA, save=save)
+    print("[Phase 1] Price Action + Volume Profile")
+    phase1(data, save, out)
 
-    print('[Phase 2] Pattern Detection...')
-    phase2_pattern_detection(GLOBAL_PRICE_DATA, save=save)
+    print("[Phase 2] Pattern Detection")
+    phase2(data, save, out)
 
-    print('[Phase 3] Occupation Time Analysis...')
-    phase3_occupation_time(GLOBAL_PRICE_DATA, save=save)
+    print("[Phase 3] Occupation Time")
+    phase3(data, save, out)
 
-    print('[Phase 4] Three-Way Comparison...')
-    phase4_comparison(GLOBAL_PRICE_DATA, steps=args.steps, save=save)
+    print("[Phase 4] Four-Model Comparison")
+    phase4(args.steps, args.seed, save, out)
 
-    print('\nDone.')
+    print("[Phase 5] smart_money_ratio Sensitivity")
+    phase5(args.steps, args.seed, save, out)
+
+    print("Done.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
