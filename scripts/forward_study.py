@@ -1,28 +1,18 @@
 """
-forward_study.py  v7
+forward_study.py  v8  (auto-calibrate)
 
-修復（v7）—套用 v6 自動建議：
-  1. intra_bar 預設 2（減少影線）
-  2. shadow_noise 預設 0.15
-  3. drift_scale 預設 1.05
-  4. momentum_boost 預設 1.5
-  5. anchor_weight 預設 0.4
-  6. 新增 --shadow-clamp：限制影線最大倍率（限制 high/low 跟實體的比例）
-  7. 新增 shadow ratio 直方圖診斷（分布輸出）
+新增 --auto-calibrate:
+  掃描前 n 根 K 棒的統計特徵，自動決定以下參數：
+    intra_bar       ← avg_body_pct
+    shadow_noise    ← median shadow_ratio
+    shadow_clamp    ← p90 shadow_ratio
+    momentum_boost  ← volume autocorrelation
+    drift_decay     ← price return autocorrelation
+    vol_multiplier  ← realized_vol / theta.vol
+    drift_scale     ← last_seg_drift / hist_drift_all (相對斜率比)
 
-Example:
-    python scripts/forward_study.py \\
-        --symbol AAPL \\
-        --theta results/theta_aapl.json \\
-        --lookback 120 --forecast 30 \\
-        --seed 42 --n-paths 500 \\
-        --backbone-mr 0.06 --n-seg 6 \\
-        --hist-window 60 --intra-bar 2 \\
-        --drift-decay 0.05 --drift-scale 1.05 --anchor-weight 0.4 \\
-        --vol-multiplier 1.5 --recent-vol-window 20 \\
-        --shadow-noise 0.15 --shadow-clamp 2.0 \\
-        --momentum-boost 1.5 --path-spread 1.0 \\
-        --output results/forward_aapl
+  手動傳入的同名參數會覆蓋自動校準值。
+  --calib-window 控制校準用的 K 棒數（預設 500）。
 """
 
 from __future__ import annotations
@@ -61,20 +51,24 @@ def parse_args():
     p.add_argument("--period",            default="3y")
     p.add_argument("--interval",          default="1d")
     p.add_argument("--hist-window",       type=int,   default=60)
-    p.add_argument("--intra-bar",         type=int,   default=2,    help="預設 2: 最少影線")
-    p.add_argument("--drift-decay",       type=float, default=0.05)
-    p.add_argument("--drift-scale",       type=float, default=1.05, help="預設 1.05: v6 建議")
-    p.add_argument("--anchor-weight",     type=float, default=0.4,  help="預設 0.4: v6 建議")
-    p.add_argument("--vol-multiplier",    type=float, default=1.5)
+    p.add_argument("--intra-bar",         type=int,   default=None)
+    p.add_argument("--drift-decay",       type=float, default=None)
+    p.add_argument("--drift-scale",       type=float, default=None)
+    p.add_argument("--anchor-weight",     type=float, default=0.45)
+    p.add_argument("--vol-multiplier",    type=float, default=None)
     p.add_argument("--recent-vol-window", type=int,   default=20)
     p.add_argument("--vol-scale-min",     type=float, default=0.6)
     p.add_argument("--vol-scale-max",     type=float, default=4.0)
-    p.add_argument("--shadow-noise",      type=float, default=0.15, help="預設 0.15: v6 建議")
-    p.add_argument("--shadow-clamp",      type=float, default=2.0,
-                   help="影線最大倍率，限制 (high-low)/body <= clamp (0=不限制)")
-    p.add_argument("--momentum-boost",   type=float, default=1.5,  help="預設 1.5: v6 建議")
-    p.add_argument("--path-spread",      type=float, default=1.0)
+    p.add_argument("--shadow-noise",      type=float, default=None)
+    p.add_argument("--shadow-clamp",      type=float, default=None)
+    p.add_argument("--momentum-boost",    type=float, default=None)
+    p.add_argument("--path-spread",       type=float, default=1.0)
     p.add_argument("--output",            default="forward_study")
+    # --- auto-calibrate ---
+    p.add_argument("--auto-calibrate",    action="store_true",
+                   help="從前 n 根 K 棒自動決定模擬參數")
+    p.add_argument("--calib-window",      type=int, default=500,
+                   help="auto-calibrate 使用的 K 棒數（預設 500）")
     return p.parse_args()
 
 
@@ -91,19 +85,95 @@ def recent_realized_vol(close_arr: np.ndarray, window: int) -> float:
     return float(np.std(log_rets))
 
 
+def auto_calibrate(df: pd.DataFrame, window: int, theta_vol: float,
+                   last_seg_drift: float) -> dict:
+    """
+    從前 window 根 K 棒的統計特徵自動計算模擬參數。
+    欄位名稱使用 ensure_ohlcv 正規化後的大寫名。
+    """
+    d = df.tail(window).copy()
+    o = d["Open"].values.astype(float)
+    h = d["High"].values.astype(float)
+    l = d["Low"].values.astype(float)
+    c = d["Close"].values.astype(float)
+    v = d["Volume"].values.astype(float)
+
+    # 1. 實體大小 → intra_bar
+    body_pct = np.abs(c - o) / (o + 1e-8)
+    avg_body = float(np.mean(body_pct))
+    if avg_body > 0.015:
+        intra_bar = 2
+    elif avg_body > 0.008:
+        intra_bar = 3
+    else:
+        intra_bar = 4
+
+    # 2. 影線比例 → shadow_noise + shadow_clamp
+    body_size = np.abs(c - o) + 1e-8
+    full_range = h - l
+    sr = full_range / body_size
+    median_sr = float(np.median(sr))
+    p90_sr    = float(np.percentile(sr, 90))
+    shadow_noise = float(np.clip(median_sr * 0.08, 0.06, 0.30))
+    shadow_clamp = float(np.clip(p90_sr * 0.8, 1.5, 5.0))
+
+    # 3. 成交量自相關 → momentum_boost
+    v_ret = pd.Series(v).pct_change().dropna()
+    vol_autocorr = float(v_ret.autocorr(lag=1)) if len(v_ret) > 10 else 0.0
+    vol_autocorr = max(vol_autocorr, 0.0)  # 只用正相關
+    momentum_boost = float(np.clip(1.0 + vol_autocorr * 2.0, 1.0, 3.0))
+
+    # 4. 價格報酬自相關 → drift_decay
+    #    正自相關（趨勢市）→ 慢衰減；負自相關（震盪市）→ 快衰減
+    p_ret = pd.Series(c).pct_change().dropna()
+    ret_autocorr = float(p_ret.autocorr(lag=1)) if len(p_ret) > 10 else 0.0
+    drift_decay = float(np.clip(0.07 - ret_autocorr * 0.06, 0.01, 0.15))
+
+    # 5. 實現波動率 → vol_multiplier
+    log_rets = np.diff(np.log(c))
+    rv = float(np.std(log_rets))
+    vol_multiplier = float(np.clip(rv / max(theta_vol, 1e-8), 0.5, 3.0))
+
+    # 6. 相對斜率比 → drift_scale
+    #    最近段斜率 vs 整體歷史斜率 → 判斷現在是「強勢」還是「弱勢」
+    hist_drift_all = float(np.mean(log_rets))
+    if abs(hist_drift_all) > 1e-6:
+        relative_momentum = last_seg_drift / abs(hist_drift_all)
+        drift_scale = float(np.clip(relative_momentum * 0.6, 0.5, 2.5))
+    else:
+        drift_scale = 1.0
+
+    return {
+        "intra_bar":       intra_bar,
+        "shadow_noise":    round(shadow_noise, 3),
+        "shadow_clamp":    round(shadow_clamp, 2),
+        "momentum_boost":  round(momentum_boost, 2),
+        "drift_decay":     round(drift_decay, 4),
+        "vol_multiplier":  round(vol_multiplier, 3),
+        "drift_scale":     round(drift_scale, 3),
+        # 診斷用
+        "_avg_body_pct":   round(avg_body * 100, 4),
+        "_median_sr":      round(median_sr, 3),
+        "_p90_sr":         round(p90_sr, 3),
+        "_vol_autocorr":   round(vol_autocorr, 4),
+        "_ret_autocorr":   round(ret_autocorr, 4),
+        "_rv_pct":         round(rv * 100, 4),
+        "_hist_drift_all": round(hist_drift_all * 100, 4),
+        "_last_seg_drift": round(last_seg_drift * 100, 4),
+    }
+
+
 def clamp_shadows(ohlcv_open, ohlcv_high, ohlcv_low, ohlcv_close, shadow_clamp: float):
-    """強制影線不超過實體的 shadow_clamp 倍"""
     if shadow_clamp <= 0:
         return ohlcv_high.copy(), ohlcv_low.copy()
-    body_top    = np.maximum(ohlcv_open, ohlcv_close)
-    body_bot    = np.minimum(ohlcv_open, ohlcv_close)
-    body_size   = body_top - body_bot
-    max_shadow  = body_size * shadow_clamp
-    new_high    = np.minimum(ohlcv_high, body_top + max_shadow)
-    new_low     = np.maximum(ohlcv_low,  body_bot - max_shadow)
-    # 確保 high >= max(open,close) 且 low <= min(open,close)
-    new_high    = np.maximum(new_high, body_top)
-    new_low     = np.minimum(new_low,  body_bot)
+    body_top   = np.maximum(ohlcv_open, ohlcv_close)
+    body_bot   = np.minimum(ohlcv_open, ohlcv_close)
+    body_size  = body_top - body_bot
+    max_shadow = body_size * shadow_clamp
+    new_high   = np.minimum(ohlcv_high, body_top + max_shadow)
+    new_low    = np.maximum(ohlcv_low,  body_bot - max_shadow)
+    new_high   = np.maximum(new_high, body_top)
+    new_low    = np.minimum(new_low,  body_bot)
     return new_high, new_low
 
 
@@ -136,7 +206,8 @@ def compute_metrics(actual, median, p25, p75, p10, p90, start_price):
 def print_diagnostics(
     args, theta, close_hist, actual_close,
     rv, vol_scale, last_drift, last_vol, bb_result,
-    result, clamped_high, clamped_low, start_price, metrics
+    result, clamped_high, clamped_low, start_price, metrics,
+    calib_info=None
 ):
     T = args.forecast
     actual_end   = float(actual_close[-1]) if len(actual_close) else None
@@ -161,7 +232,6 @@ def print_diagnostics(
     seg_drifts = [f"{d*100:+.3f}%" for d in bb_result.segment_drifts]
     seg_vols   = [f"{v*100:.3f}%"  for v in bb_result.segment_vols]
 
-    # K 棒形態（使用 clamped high/low）
     body_sizes    = np.abs(result.ohlcv_close - result.ohlcv_open)
     upper_shadows = clamped_high - np.maximum(result.ohlcv_open, result.ohlcv_close)
     lower_shadows = np.minimum(result.ohlcv_open, result.ohlcv_close) - clamped_low
@@ -175,17 +245,23 @@ def print_diagnostics(
         np.sign(result.ohlcv_close[1:] - result.ohlcv_close[:-1]) ==
         np.sign(result.median_path[1:] - result.median_path[:-1])
     ))
-
-    # 比對歷史 K 棒
-    hist_close_arr = close_hist
-    hist_open_arr  = np.array([])
-    # 只用收益率過似估算體積大小
-    hist_ret_std   = float(np.std(np.diff(np.log(hist_close_arr)))) * 100
+    hist_ret_std = float(np.std(np.diff(np.log(close_hist)))) * 100
 
     print()
     print("=" * 60)
-    print("  VERBOSE DIAGNOSTICS (v7)")
+    print("  VERBOSE DIAGNOSTICS (v8 auto-calibrate)")
     print("=" * 60)
+
+    # --- 自動校準區塊 ---
+    if calib_info is not None:
+        print(f"\n[自動校準結果 (window={args.calib_window})]")
+        print(f"  avg_body_pct (hist)  : {calib_info['_avg_body_pct']:.3f}%  → intra_bar={args.intra_bar}")
+        print(f"  median_shadow_ratio  : {calib_info['_median_sr']:.3f}  → shadow_noise={args.shadow_noise}")
+        print(f"  p90_shadow_ratio     : {calib_info['_p90_sr']:.3f}  → shadow_clamp={args.shadow_clamp}")
+        print(f"  vol_autocorr         : {calib_info['_vol_autocorr']:+.4f}  → momentum_boost={args.momentum_boost}")
+        print(f"  ret_autocorr         : {calib_info['_ret_autocorr']:+.4f}  → drift_decay={args.drift_decay}")
+        print(f"  realized_vol/theta   : {calib_info['_rv_pct']:.4f}%/{theta.vol*100:.4f}%  → vol_multiplier={args.vol_multiplier}")
+        print(f"  last_seg / hist_all  : {calib_info['_last_seg_drift']:+.4f}% / {calib_info['_hist_drift_all']:+.4f}%  → drift_scale={args.drift_scale}")
 
     print(f"\n[資料概況]")
     print(f"  symbol        : {args.symbol}")
@@ -210,35 +286,27 @@ def print_diagnostics(
 
     print(f"\n[K 棒形態診斷]")
     status_body = " \u2705" if 0.3 <= avg_body_pct <= 1.5 else (" \u26a0 太大" if avg_body_pct > 1.5 else " \u274c 太小")
-    status_shad = " \u2705" if avg_shadow_ratio <= 2.0 else f" \u274c 過大(clamp={args.shadow_clamp})"
+    status_shad = " \u2705" if avg_shadow_ratio <= 2.0 else f" \u274c 過大"
     print(f"  avg_body_pct       : {avg_body_pct:.3f}%  (目標: 0.3~1.5%){status_body}")
     print(f"  avg_shadow_ratio   : {avg_shadow_ratio:.2f}   (目標: 0.5~2.0){status_shad}")
-    print(f"  p50_shadow_ratio   : {p50_shadow_ratio:.2f}   (中位數, 較少受極端影線影響)")
-    print(f"  p90_shadow_ratio   : {p90_shadow_ratio:.2f}   (極端 K 棒影線狀況)")
-    print(f"  shadow_clamp       : {args.shadow_clamp}x  (影線/實體上限)")
-    print(f"  hist_ret_std       : {hist_ret_std:.3f}%/day  (歷史收益率標準差參考)")
-    print(f"  direction_consist  : {direction_consistency:.2f}   (高=K 棒方向跟 median 一致)")
-    if avg_shadow_ratio > 2.5:
-        suggest_intra = max(1, args.intra_bar - 1)
-        suggest_sn    = round(max(0.05, args.shadow_noise - 0.1), 2)
-        suggest_clamp = round(max(0.5,  args.shadow_clamp - 0.5), 1)
-        print(f"  \u2757 影線過多：建議 --intra-bar {suggest_intra} / --shadow-noise {suggest_sn} / --shadow-clamp {suggest_clamp}")
-    if avg_body_pct > 2.5:
-        suggest_ds = round(args.drift_scale * 0.8, 2)
-        print(f"  \u2757 實體過大(路徑跳動太劇烈)：建議 --drift-scale {suggest_ds} / --intra-bar 增加")
+    print(f"  p50_shadow_ratio   : {p50_shadow_ratio:.2f}")
+    print(f"  p90_shadow_ratio   : {p90_shadow_ratio:.2f}")
+    print(f"  shadow_clamp       : {args.shadow_clamp}x")
+    print(f"  hist_ret_std       : {hist_ret_std:.3f}%/day")
+    print(f"  direction_consist  : {direction_consistency:.2f}")
 
-    print(f"\n[漬動對照]")
+    print(f"\n[漂移對照]")
     print(f"  theta.drift             : {theta.drift*100:+.4f}%/day")
     print(f"  last_seg_drift (bb)     : {last_drift*100:+.4f}%/day")
     print(f"  hist_drift_20d          : {hist_drift_20*100:+.4f}%/day")
     if hist_drift_60:
         print(f"  hist_drift_60d          : {hist_drift_60*100:+.4f}%/day")
     print(f"  hist_drift_all({args.lookback:3d}d)  : {hist_drift_all*100:+.4f}%/day")
-    print(f"  median_daily_drift      : {median_daily_drift*100:+.4f}%/day  (實際模擬)")
+    print(f"  median_daily_drift      : {median_daily_drift*100:+.4f}%/day")
     if actual_daily_drift:
-        print(f"  actual_daily_drift      : {actual_daily_drift*100:+.4f}%/day  (實際後續)")
+        print(f"  actual_daily_drift      : {actual_daily_drift*100:+.4f}%/day")
         drift_gap = (median_daily_drift - actual_daily_drift) * 100
-        print(f"  drift_gap(med-act)      : {drift_gap:+.4f}%/day  (正=median偏快, 負=median偏慢)")
+        print(f"  drift_gap(med-act)      : {drift_gap:+.4f}%/day")
 
     print(f"\n[波動率分析]")
     print(f"  theta.vol (long-term)   : {theta.vol*100:.4f}%/day")
@@ -277,18 +345,18 @@ def print_diagnostics(
             flag = " \u2705 好" if v >= 0.6 else (" \u26a0 遠於隨機" if v >= 0.5 else " \u274c 差於擲母")
         if k == "bars_above_p90" and isinstance(v, int):
             pct = v / max(metrics.get("n_compared", 30), 1)
-            if pct > 0.3: flag = f" \u274c 帶子偶尔偏低({pct:.0%})"
+            if pct > 0.3: flag = f" \u274c 帶子偶爾偏低({pct:.0%})"
         if k == "bars_below_p10" and isinstance(v, int):
             pct = v / max(metrics.get("n_compared", 30), 1)
-            if pct > 0.3: flag = f" \u274c 帶子偶尔偏高({pct:.0%})"
+            if pct > 0.3: flag = f" \u274c 帶子偶爾偏高({pct:.0%})"
         print(f"  {k:25s}: {v}{flag}")
 
     print(f"\n[自動建議]")
     suggestions = []
     if metrics.get("hit_rate_10_90", 0) < 0.5:
-        suggestions.append("  \u2022 帶子太窄: --vol-multiplier +0.3 或減小 --recent-vol-window")
+        suggestions.append("  \u2022 帶子太窄: --vol-multiplier +0.3")
     if metrics.get("hit_rate_10_90", 0) > 0.95 and metrics.get("hit_rate_25_75", 0) < 0.25:
-        suggestions.append("  \u2022 帶子寬但中心線偏: 調整 drift_scale 是首要任務")
+        suggestions.append("  \u2022 帶子寬但中心線偏: 調整 drift_scale")
     if center_bias is not None:
         if center_bias > 3.0:
             new_ds = round(args.drift_scale * 0.7, 2)
@@ -300,17 +368,8 @@ def print_diagnostics(
             suggestions.append(f"  \u2022 帶子中心線偏移 {center_bias:+.1f}% \u2705 可接受")
     if metrics.get("direction_acc", 1) < 0.5:
         suggestions.append(
-            f"  \u2022 方向准確度差: --momentum-boost {round(min(args.momentum_boost + 0.3, 2.5), 1)}"
-            f" 或 --anchor-weight {round(min(args.anchor_weight + 0.1, 0.7), 1)}"
+            f"  \u2022 方向準確度差: --momentum-boost {round(min(args.momentum_boost + 0.3, 2.5), 1)}"
         )
-    if avg_shadow_ratio > 2.5:
-        suggestions.append(
-            f"  \u2022 影線過多({avg_shadow_ratio:.1f}x): --intra-bar {max(1, args.intra_bar-1)}"
-            f" / --shadow-noise {round(max(0.05, args.shadow_noise-0.1), 2)}"
-            f" / --shadow-clamp {round(max(0.5, args.shadow_clamp-0.5), 1)}"
-        )
-    if avg_body_pct > 2.5:
-        suggestions.append(f"  \u2022 實體過大({avg_body_pct:.2f}%): --drift-scale {round(args.drift_scale*0.8,2)} / --intra-bar 增加")
     if not suggestions:
         suggestions.append("  \u2022 目前參數已處於較好狀態 \u2705")
     for s in suggestions:
@@ -371,6 +430,41 @@ def main():
         rv / max(theta.vol, 1e-8),
         args.vol_scale_min, args.vol_scale_max,
     ))
+
+    # === AUTO CALIBRATE ===
+    calib_info = None
+    calib_window = min(args.calib_window, len(df) - args.forecast)
+    calib_df = df.iloc[train_end_idx - calib_window: train_end_idx]
+
+    if args.auto_calibrate:
+        print(f"\n[auto-calibrate] 掃描前 {calib_window} 根 K 棒...")
+        calib = auto_calibrate(
+            calib_df, window=calib_window,
+            theta_vol=theta.vol, last_seg_drift=last_drift
+        )
+        calib_info = calib
+        # 套用校準值，手動傳入的參數覆蓋
+        if args.intra_bar       is None: args.intra_bar       = calib["intra_bar"]
+        if args.shadow_noise    is None: args.shadow_noise    = calib["shadow_noise"]
+        if args.shadow_clamp    is None: args.shadow_clamp    = calib["shadow_clamp"]
+        if args.momentum_boost  is None: args.momentum_boost  = calib["momentum_boost"]
+        if args.drift_decay     is None: args.drift_decay     = calib["drift_decay"]
+        if args.vol_multiplier  is None: args.vol_multiplier  = calib["vol_multiplier"]
+        if args.drift_scale     is None: args.drift_scale     = calib["drift_scale"]
+        print(f"  intra_bar={args.intra_bar}  shadow_noise={args.shadow_noise}"
+              f"  shadow_clamp={args.shadow_clamp}")
+        print(f"  momentum_boost={args.momentum_boost}  drift_decay={args.drift_decay}"
+              f"  vol_multiplier={args.vol_multiplier}  drift_scale={args.drift_scale}")
+    else:
+        # 沒有 auto-calibrate 時套用預設值（向後相容 v7）
+        if args.intra_bar      is None: args.intra_bar      = 2
+        if args.shadow_noise   is None: args.shadow_noise   = 0.15
+        if args.shadow_clamp   is None: args.shadow_clamp   = 2.0
+        if args.momentum_boost is None: args.momentum_boost = 1.6
+        if args.drift_decay    is None: args.drift_decay    = 0.04
+        if args.vol_multiplier is None: args.vol_multiplier = 1.2
+        if args.drift_scale    is None: args.drift_scale    = 1.18
+
     vol_fwd_scaled = vol_fwd * args.vol_multiplier
 
     estimator   = MarketParameterEstimator(lookback=ESTIMATOR_LB, vp_bins=40, momentum_window=10)
@@ -404,7 +498,6 @@ def main():
     )
     result = sim.simulate()
 
-    # v7: 影線 clamp 後用於畫圖和診斷
     clamped_high, clamped_low = clamp_shadows(
         result.ohlcv_open, result.ohlcv_high,
         result.ohlcv_low,  result.ohlcv_close,
@@ -427,6 +520,7 @@ def main():
         result=result,
         clamped_high=clamped_high, clamped_low=clamped_low,
         start_price=start_price, metrics=metrics,
+        calib_info=calib_info,
     )
 
     out_prefix   = Path(args.output)
@@ -447,6 +541,8 @@ def main():
             "actual_end":       float(actual_close[-1]) if len(actual_close) else None,
             "median_end":       float(result.median_path[-1]),
             "rep_end":          float(result.representative_path[-1]),
+            "auto_calibrate":   args.auto_calibrate,
+            "calib_window":     args.calib_window,
         }, f, indent=2)
 
     actual_deviation = None
@@ -454,6 +550,7 @@ def main():
         m = min(len(actual_close), len(result.median_path))
         actual_deviation = (actual_close[:m] - result.median_path[:m]) / start_price * 100
 
+    mode_tag = f"auto(w={args.calib_window})" if args.auto_calibrate else "manual"
     hit_str = ""
     if metrics:
         hit_str = (
@@ -464,10 +561,10 @@ def main():
             f"  end_err={metrics['end_error_pct']:.2f}%"
         )
     title = (
-        f"{args.symbol} | v7 | intra={args.intra_bar}  ds={args.drift_scale}"
-        f"  mb={args.momentum_boost}  clamp={args.shadow_clamp}\n"
-        f"rv={rv:.4f}  vol_scale={vol_scale:.2f}  vol_x={args.vol_multiplier}"
-        f"  aw={args.anchor_weight}" + hit_str
+        f"{args.symbol} | v8 {mode_tag} | ds={args.drift_scale}"
+        f"  mb={args.momentum_boost}  dd={args.drift_decay}\n"
+        f"rv={rv:.4f}  vol_x={args.vol_multiplier}"
+        f"  intra={args.intra_bar}  clamp={args.shadow_clamp}" + hit_str
     )
 
     fwd_volume_norm = result.ohlcv_volume / (result.ohlcv_volume.mean() + 1e-8)
@@ -495,7 +592,7 @@ def main():
     )
     plt.close(fig)
 
-    print(f"\n\u2714 Forward study v7 完成")
+    print(f"\n\u2714 Forward study v8 完成")
     print(f"  K 棒圖 : {chart_path}")
     print(f"  指標   : {metrics_path}")
 
