@@ -1,18 +1,14 @@
 """
-forward_study.py  v8  (auto-calibrate)
+forward_study.py  v9  (GJR-GARCH + auto-calibrate)
 
-新增 --auto-calibrate:
-  掃描前 n 根 K 棒的統計特徵，自動決定以下參數：
-    intra_bar       ← avg_body_pct
-    shadow_noise    ← median shadow_ratio
-    shadow_clamp    ← p90 shadow_ratio
-    momentum_boost  ← volume autocorrelation
-    drift_decay     ← price return autocorrelation
-    vol_multiplier  ← realized_vol / theta.vol
-    drift_scale     ← last_seg_drift / hist_drift_all (相對斜率比)
+新增 Phase 1+2 波動率模型升級：
+  vol_multiplier 不再用 rv/theta 靜態比值，
+  改用 GJR-GARCH(1,1,1)-t 預測的 1-step-ahead σ。
+  - 若 arch 未安裝 → 自動 fallback 回 rv/theta 靜態比值
+  - --garch-model  : 'gjr' (預設) | 'garch' | 'egarch'
+  - --no-garch     : 強制關閉，退回靜態 rv/theta
 
-  手動傳入的同名參數會覆蓋自動校準值。
-  --calib-window 控制校準用的 K 棒數（預設 500）。
+v8 的 --auto-calibrate 其餘邏輯不變。
 """
 
 from __future__ import annotations
@@ -36,6 +32,78 @@ from calibrated_simulator import CalibratedTheta, build_params_from_theta
 from us_equity_simulator import USStockFutureSimulator
 from candle_renderer import render_forecast_candles
 
+
+# ─────────────────────────────────────────────────────────────
+# GJR-GARCH 波動率預測（Phase 1+2）
+# ─────────────────────────────────────────────────────────────
+
+def garch_vol_forecast(
+    close_arr: np.ndarray,
+    model_type: str = "gjr",
+) -> tuple[float, dict]:
+    """
+    用 GJR-GARCH(1,1,1)-t 預測明日 1-step-ahead σ (日標準差)。
+
+    Parameters
+    ----------
+    close_arr  : 收盤價陣列（用於計算對數報酬）
+    model_type : 'gjr' | 'garch' | 'egarch'
+
+    Returns
+    -------
+    forecast_vol : float  — 預測波動率（日標準差，比例形式）
+    info         : dict   — 診斷資訊
+    """
+    try:
+        from arch import arch_model
+    except ImportError:
+        return None, {"error": "arch not installed"}
+
+    try:
+        rets = pd.Series(np.diff(np.log(close_arr)) * 100)  # 百分比報酬
+        rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(rets) < 60:
+            return None, {"error": "too few returns"}
+
+        if model_type == "gjr":
+            # GJR-GARCH(1,1,1) with Student-t errors
+            # o=1 捕捉槓桿效應：下跌時波動率放大幅度 > 上漲
+            am = arch_model(rets, vol="Garch", p=1, o=1, q=1, dist="t")
+        elif model_type == "egarch":
+            am = arch_model(rets, vol="EGarch", p=1, q=1, dist="t")
+        else:
+            am = arch_model(rets, vol="Garch", p=1, q=1, dist="t")
+
+        res = am.fit(disp="off", show_warning=False)
+        fc  = res.forecast(horizon=1, reindex=False)
+        forecast_var = float(fc.variance.values[-1, 0])       # 單位: (%)²
+        forecast_vol = np.sqrt(forecast_var) / 100            # 轉回小數標準差
+
+        # 診斷：α、γ（槓桿項）、β
+        params = res.params
+        info = {
+            "model":       model_type,
+            "omega":       round(float(params.get("omega", 0)), 6),
+            "alpha":       round(float(params.get("alpha[1]", 0)), 4),
+            "gamma":       round(float(params.get("gamma[1]", 0)), 4),   # GJR 槓桿項
+            "beta":        round(float(params.get("beta[1]",  0)), 4),
+            "persistence": round(
+                float(params.get("alpha[1]", 0))
+                + float(params.get("beta[1]",  0))
+                + 0.5 * float(params.get("gamma[1]", 0)),
+                4
+            ),
+            "forecast_vol_pct": round(forecast_vol * 100, 4),
+        }
+        return forecast_vol, info
+
+    except Exception as e:
+        return None, {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────
+# 公用工具
+# ─────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -65,10 +133,14 @@ def parse_args():
     p.add_argument("--path-spread",       type=float, default=1.0)
     p.add_argument("--output",            default="forward_study")
     # --- auto-calibrate ---
-    p.add_argument("--auto-calibrate",    action="store_true",
-                   help="從前 n 根 K 棒自動決定模擬參數")
-    p.add_argument("--calib-window",      type=int, default=500,
-                   help="auto-calibrate 使用的 K 棒數（預設 500）")
+    p.add_argument("--auto-calibrate",    action="store_true")
+    p.add_argument("--calib-window",      type=int, default=500)
+    # --- GARCH 波動率模型 (v9) ---
+    p.add_argument("--garch-model",       default="gjr",
+                   choices=["gjr", "garch", "egarch"],
+                   help="GARCH 模型類型 (預設 gjr=GJR-GARCH)")
+    p.add_argument("--no-garch",          action="store_true",
+                   help="停用 GARCH，退回靜態 rv/theta 比值")
     return p.parse_args()
 
 
@@ -85,11 +157,17 @@ def recent_realized_vol(close_arr: np.ndarray, window: int) -> float:
     return float(np.std(log_rets))
 
 
-def auto_calibrate(df: pd.DataFrame, window: int, theta_vol: float,
-                   last_seg_drift: float) -> dict:
+def auto_calibrate(
+    df: pd.DataFrame,
+    window: int,
+    theta_vol: float,
+    last_seg_drift: float,
+    use_garch: bool = True,
+    garch_model: str = "gjr",
+) -> dict:
     """
-    從前 window 根 K 棒的統計特徵自動計算模擬參數。
-    欄位名稱使用 ensure_ohlcv 正規化後的大寫名。
+    v9 升級：vol_multiplier 優先使用 GJR-GARCH 1-step-ahead σ，
+    fallback 到 rv/theta 靜態比值。
     """
     d = df.tail(window).copy()
     o = d["Open"].values.astype(float)
@@ -120,22 +198,33 @@ def auto_calibrate(df: pd.DataFrame, window: int, theta_vol: float,
     # 3. 成交量自相關 → momentum_boost
     v_ret = pd.Series(v).pct_change().dropna()
     vol_autocorr = float(v_ret.autocorr(lag=1)) if len(v_ret) > 10 else 0.0
-    vol_autocorr = max(vol_autocorr, 0.0)  # 只用正相關
+    vol_autocorr = max(vol_autocorr, 0.0)
     momentum_boost = float(np.clip(1.0 + vol_autocorr * 2.0, 1.0, 3.0))
 
     # 4. 價格報酬自相關 → drift_decay
-    #    正自相關（趨勢市）→ 慢衰減；負自相關（震盪市）→ 快衰減
     p_ret = pd.Series(c).pct_change().dropna()
     ret_autocorr = float(p_ret.autocorr(lag=1)) if len(p_ret) > 10 else 0.0
     drift_decay = float(np.clip(0.07 - ret_autocorr * 0.06, 0.01, 0.15))
 
-    # 5. 實現波動率 → vol_multiplier
+    # 5. 實現波動率（備用）
     log_rets = np.diff(np.log(c))
     rv = float(np.std(log_rets))
-    vol_multiplier = float(np.clip(rv / max(theta_vol, 1e-8), 0.5, 3.0))
+    rv_vol_multiplier = float(np.clip(rv / max(theta_vol, 1e-8), 0.5, 3.0))
+
+    # 5b. GJR-GARCH 預測波動率 → vol_multiplier  (v9 核心升級)
+    garch_info = {}
+    garch_vol  = None
+    if use_garch:
+        garch_vol, garch_info = garch_vol_forecast(c, model_type=garch_model)
+
+    if garch_vol is not None and garch_vol > 0:
+        vol_multiplier = float(np.clip(garch_vol / max(theta_vol, 1e-8), 0.5, 3.0))
+        vol_source = "garch"
+    else:
+        vol_multiplier = rv_vol_multiplier
+        vol_source = "rv_fallback"
 
     # 6. 相對斜率比 → drift_scale
-    #    最近段斜率 vs 整體歷史斜率 → 判斷現在是「強勢」還是「弱勢」
     hist_drift_all = float(np.mean(log_rets))
     if abs(hist_drift_all) > 1e-6:
         relative_momentum = last_seg_drift / abs(hist_drift_all)
@@ -151,15 +240,18 @@ def auto_calibrate(df: pd.DataFrame, window: int, theta_vol: float,
         "drift_decay":     round(drift_decay, 4),
         "vol_multiplier":  round(vol_multiplier, 3),
         "drift_scale":     round(drift_scale, 3),
-        # 診斷用
-        "_avg_body_pct":   round(avg_body * 100, 4),
-        "_median_sr":      round(median_sr, 3),
-        "_p90_sr":         round(p90_sr, 3),
-        "_vol_autocorr":   round(vol_autocorr, 4),
-        "_ret_autocorr":   round(ret_autocorr, 4),
-        "_rv_pct":         round(rv * 100, 4),
-        "_hist_drift_all": round(hist_drift_all * 100, 4),
-        "_last_seg_drift": round(last_seg_drift * 100, 4),
+        # 診斷
+        "_avg_body_pct":      round(avg_body * 100, 4),
+        "_median_sr":         round(median_sr, 3),
+        "_p90_sr":            round(p90_sr, 3),
+        "_vol_autocorr":      round(vol_autocorr, 4),
+        "_ret_autocorr":      round(ret_autocorr, 4),
+        "_rv_pct":            round(rv * 100, 4),
+        "_hist_drift_all":    round(hist_drift_all * 100, 4),
+        "_last_seg_drift":    round(last_seg_drift * 100, 4),
+        "_garch_info":        garch_info,
+        "_vol_source":        vol_source,
+        "_rv_vol_multiplier": round(rv_vol_multiplier, 3),
     }
 
 
@@ -249,18 +341,34 @@ def print_diagnostics(
 
     print()
     print("=" * 60)
-    print("  VERBOSE DIAGNOSTICS (v8 auto-calibrate)")
+    print("  VERBOSE DIAGNOSTICS (v9 GJR-GARCH + auto-calibrate)")
     print("=" * 60)
 
     # --- 自動校準區塊 ---
     if calib_info is not None:
+        gi = calib_info.get("_garch_info", {})
+        vs = calib_info.get("_vol_source", "?")
+        rv_vm = calib_info.get("_rv_vol_multiplier", "?")
         print(f"\n[自動校準結果 (window={args.calib_window})]")
         print(f"  avg_body_pct (hist)  : {calib_info['_avg_body_pct']:.3f}%  → intra_bar={args.intra_bar}")
         print(f"  median_shadow_ratio  : {calib_info['_median_sr']:.3f}  → shadow_noise={args.shadow_noise}")
         print(f"  p90_shadow_ratio     : {calib_info['_p90_sr']:.3f}  → shadow_clamp={args.shadow_clamp}")
         print(f"  vol_autocorr         : {calib_info['_vol_autocorr']:+.4f}  → momentum_boost={args.momentum_boost}")
         print(f"  ret_autocorr         : {calib_info['_ret_autocorr']:+.4f}  → drift_decay={args.drift_decay}")
-        print(f"  realized_vol/theta   : {calib_info['_rv_pct']:.4f}%/{theta.vol*100:.4f}%  → vol_multiplier={args.vol_multiplier}")
+        # v9 升級：顯示 GARCH 詳情
+        if vs == "garch" and gi and "error" not in gi:
+            print(f"  [v9 GJR-GARCH-t 波動率預測]")
+            print(f"    model          : {gi.get('model','?')}")
+            print(f"    α (ARCH)       : {gi.get('alpha','?')}")
+            print(f"    γ (槓桿GJR)    : {gi.get('gamma','?')}  ← 下跌時波動放大")
+            print(f"    β (GARCH)      : {gi.get('beta','?')}")
+            print(f"    persistence    : {gi.get('persistence','?')}  (α+β+0.5γ, <1=穩定)")
+            print(f"    forecast σ/day : {gi.get('forecast_vol_pct','?')}%  → vol_multiplier={args.vol_multiplier}")
+            print(f"    rv/theta (靜態): {calib_info['_rv_pct']:.4f}%/{theta.vol*100:.4f}%  → {rv_vm} (備用)")
+        else:
+            err = gi.get("error", "unknown") if gi else "disabled"
+            print(f"  realized_vol/theta   : {calib_info['_rv_pct']:.4f}%/{theta.vol*100:.4f}%  → vol_multiplier={args.vol_multiplier}")
+            print(f"  vol_source           : rv_fallback  (garch 失敗: {err})")
         print(f"  last_seg / hist_all  : {calib_info['_last_seg_drift']:+.4f}% / {calib_info['_hist_drift_all']:+.4f}%  → drift_scale={args.drift_scale}")
 
     print(f"\n[資料概況]")
@@ -277,7 +385,7 @@ def print_diagnostics(
     print(f"\n[帶子中心偏移分析]")
     if center_bias is not None:
         direction = (
-            "\u2191 median 高低估 \u2192 降低 drift_scale" if center_bias > 0
+            "\u2191 median 高估 \u2192 降低 drift_scale" if center_bias > 0
             else "\u2193 median 低估 \u2192 提高 drift_scale"
         )
         flag = " \u2705" if abs(center_bias) <= 3 else " \u274c"
@@ -431,19 +539,22 @@ def main():
         args.vol_scale_min, args.vol_scale_max,
     ))
 
-    # === AUTO CALIBRATE ===
+    # === AUTO CALIBRATE (v9) ===
     calib_info = None
     calib_window = min(args.calib_window, len(df) - args.forecast)
     calib_df = df.iloc[train_end_idx - calib_window: train_end_idx]
 
+    use_garch = args.auto_calibrate and not args.no_garch
+
     if args.auto_calibrate:
-        print(f"\n[auto-calibrate] 掃描前 {calib_window} 根 K 棒...")
+        model_label = "disabled" if args.no_garch else args.garch_model.upper()
+        print(f"\n[auto-calibrate v9] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             calib_df, window=calib_window,
-            theta_vol=theta.vol, last_seg_drift=last_drift
+            theta_vol=theta.vol, last_seg_drift=last_drift,
+            use_garch=use_garch, garch_model=args.garch_model,
         )
         calib_info = calib
-        # 套用校準值，手動傳入的參數覆蓋
         if args.intra_bar       is None: args.intra_bar       = calib["intra_bar"]
         if args.shadow_noise    is None: args.shadow_noise    = calib["shadow_noise"]
         if args.shadow_clamp    is None: args.shadow_clamp    = calib["shadow_clamp"]
@@ -451,12 +562,16 @@ def main():
         if args.drift_decay     is None: args.drift_decay     = calib["drift_decay"]
         if args.vol_multiplier  is None: args.vol_multiplier  = calib["vol_multiplier"]
         if args.drift_scale     is None: args.drift_scale     = calib["drift_scale"]
-        print(f"  intra_bar={args.intra_bar}  shadow_noise={args.shadow_noise}"
-              f"  shadow_clamp={args.shadow_clamp}")
-        print(f"  momentum_boost={args.momentum_boost}  drift_decay={args.drift_decay}"
-              f"  vol_multiplier={args.vol_multiplier}  drift_scale={args.drift_scale}")
+        gi = calib.get("_garch_info", {})
+        vs = calib.get("_vol_source", "?")
+        print(f"  intra_bar={args.intra_bar}  shadow_noise={args.shadow_noise}  shadow_clamp={args.shadow_clamp}")
+        print(f"  momentum_boost={args.momentum_boost}  drift_decay={args.drift_decay}")
+        if vs == "garch" and gi and "error" not in gi:
+            print(f"  vol_multiplier={args.vol_multiplier}  [GJR-GARCH σ={gi.get('forecast_vol_pct','?')}%/day  "
+                  f"γ={gi.get('gamma','?')} β={gi.get('beta','?')} persistence={gi.get('persistence','?')}]")
+        else:
+            print(f"  vol_multiplier={args.vol_multiplier}  [rv/theta fallback]  drift_scale={args.drift_scale}")
     else:
-        # 沒有 auto-calibrate 時套用預設值（向後相容 v7）
         if args.intra_bar      is None: args.intra_bar      = 2
         if args.shadow_noise   is None: args.shadow_noise   = 0.15
         if args.shadow_clamp   is None: args.shadow_clamp   = 2.0
@@ -543,6 +658,8 @@ def main():
             "rep_end":          float(result.representative_path[-1]),
             "auto_calibrate":   args.auto_calibrate,
             "calib_window":     args.calib_window,
+            "vol_model":        args.garch_model if not args.no_garch else "rv_static",
+            "garch_info":       calib_info.get("_garch_info", {}) if calib_info else {},
         }, f, indent=2)
 
     actual_deviation = None
@@ -550,7 +667,7 @@ def main():
         m = min(len(actual_close), len(result.median_path))
         actual_deviation = (actual_close[:m] - result.median_path[:m]) / start_price * 100
 
-    mode_tag = f"auto(w={args.calib_window})" if args.auto_calibrate else "manual"
+    mode_tag = f"v9-{args.garch_model}(w={args.calib_window})" if args.auto_calibrate else "manual"
     hit_str = ""
     if metrics:
         hit_str = (
@@ -561,7 +678,7 @@ def main():
             f"  end_err={metrics['end_error_pct']:.2f}%"
         )
     title = (
-        f"{args.symbol} | v8 {mode_tag} | ds={args.drift_scale}"
+        f"{args.symbol} | {mode_tag} | ds={args.drift_scale}"
         f"  mb={args.momentum_boost}  dd={args.drift_decay}\n"
         f"rv={rv:.4f}  vol_x={args.vol_multiplier}"
         f"  intra={args.intra_bar}  clamp={args.shadow_clamp}" + hit_str
@@ -592,7 +709,7 @@ def main():
     )
     plt.close(fig)
 
-    print(f"\n\u2714 Forward study v8 完成")
+    print(f"\n\u2714 Forward study v9 完成")
     print(f"  K 棒圖 : {chart_path}")
     print(f"  指標   : {metrics_path}")
 
