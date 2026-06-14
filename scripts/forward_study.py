@@ -1,11 +1,13 @@
 """
-forward_study.py  v5
+forward_study.py  v6
 
-新增（v5）：詳細診斷 log
-  - 每個階段的計算細節都印出
-  - 帶子中心線 vs 實際走勢的偏移分析
-  - 自動建議 drift_scale 調整范圍
-  - 路徑散度統計（帶子寬窄程度評估）
+修復（v6）：
+  1. drift_scale 預設改為 0.75（根據 v5 自動建議）
+  2. intra_bar_steps 預設改為 4（減少路徑内橫步數，讓 K 棒高低差更自然）
+  3. 新增 --shadow-noise 參數（控制影線隨機性）
+  4. 新增 --momentum-boost 參數（加大連續走勢驅動）
+  5. 新增 --path-spread 參數（調整路徑散度，對抗過度平滑）
+  6. v5 詳細 log 全部保留
 
 Example:
     python scripts/forward_study.py \\
@@ -14,9 +16,10 @@ Example:
         --lookback 120 --forecast 30 \\
         --seed 42 --n-paths 500 \\
         --backbone-mr 0.06 --n-seg 6 \\
-        --hist-window 60 --intra-bar 8 \\
-        --drift-decay 0.05 --drift-scale 0.5 --anchor-weight 0.3 \\
+        --hist-window 60 --intra-bar 4 \\
+        --drift-decay 0.05 --drift-scale 0.75 --anchor-weight 0.3 \\
         --vol-multiplier 1.5 --recent-vol-window 20 \\
+        --shadow-noise 0.3 --momentum-boost 1.2 --path-spread 1.0 \\
         --output results/forward_aapl
 """
 
@@ -41,8 +44,6 @@ from calibrated_simulator import CalibratedTheta, build_params_from_theta
 from us_equity_simulator import USStockFutureSimulator
 from candle_renderer import render_forecast_candles
 
-SEP = "-" * 60
-
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -58,14 +59,23 @@ def parse_args():
     p.add_argument("--period",            default="3y")
     p.add_argument("--interval",          default="1d")
     p.add_argument("--hist-window",       type=int,   default=60)
-    p.add_argument("--intra-bar",         type=int,   default=8)
+    # v6: intra-bar 預設改為 4（原來 8 造成 K 棒影線過多、走勢過平）
+    p.add_argument("--intra-bar",         type=int,   default=4)
     p.add_argument("--drift-decay",       type=float, default=0.05)
-    p.add_argument("--drift-scale",       type=float, default=0.5)
+    # v6: drift-scale 預設 0.75（v5 log 建議）
+    p.add_argument("--drift-scale",       type=float, default=0.75)
     p.add_argument("--anchor-weight",     type=float, default=0.3)
     p.add_argument("--vol-multiplier",    type=float, default=1.5)
     p.add_argument("--recent-vol-window", type=int,   default=20)
     p.add_argument("--vol-scale-min",     type=float, default=0.6)
     p.add_argument("--vol-scale-max",     type=float, default=4.0)
+    # v6 新增
+    p.add_argument("--shadow-noise",      type=float, default=0.3,
+                   help="K 棒影線隨機幅度 (0=純路徑影線, 1=完全隨機)")
+    p.add_argument("--momentum-boost",   type=float, default=1.2,
+                   help="momentum_strength 倍率 (1.0=不變, >1 加大連續走勢)")
+    p.add_argument("--path-spread",      type=float, default=1.0,
+                   help="路徑散度額外乘數 (1.0=不變, >1 路徑更分散)")
     p.add_argument("--output",            default="forward_study")
     return p.parse_args()
 
@@ -114,10 +124,7 @@ def print_diagnostics(
     rv, vol_scale, last_drift, last_vol, bb_result,
     result, start_price, metrics
 ):
-    """v5 詳細診斷 log"""
     T = args.forecast
-
-    # 實際終點 vs 預測終點
     actual_end   = float(actual_close[-1]) if len(actual_close) else None
     median_end   = float(result.median_path[-1])
     actual_chg   = (actual_end / start_price - 1) * 100 if actual_end else None
@@ -125,30 +132,40 @@ def print_diagnostics(
     p10_end      = float(result.p10[-1])
     p90_end      = float(result.p90[-1])
     band_width   = (p90_end - p10_end) / start_price * 100
-
-    # 帶子中心偏移：(median_end - actual_end) / start_price * 100
     center_bias  = (median_end - actual_end) / start_price * 100 if actual_end else None
-    # 正 = median 偏高, 負 = median 偏低
 
-    # 實際路徑的日平均漬動
     if len(actual_close) >= 2:
         actual_daily_drift = float(np.mean(np.diff(np.log(actual_close))))
     else:
         actual_daily_drift = None
     median_daily_drift = float(np.mean(np.diff(np.log(result.median_path))))
 
-    # 近期歷史走勢（用於對照）
     hist_drift_20  = float(np.mean(np.diff(np.log(close_hist[-21:]))))
     hist_drift_60  = float(np.mean(np.diff(np.log(close_hist[-61:])))) if len(close_hist) >= 61 else None
     hist_drift_all = float(np.mean(np.diff(np.log(close_hist))))
 
-    # 分段 vol 資訊
     seg_drifts = [f"{d*100:+.3f}%" for d in bb_result.segment_drifts]
     seg_vols   = [f"{v*100:.3f}%"  for v in bb_result.segment_vols]
 
+    # K 棒形態診斷
+    ohlcv_high  = result.ohlcv_high
+    ohlcv_low   = result.ohlcv_low
+    ohlcv_open  = result.ohlcv_open
+    ohlcv_close = result.ohlcv_close
+    body_sizes  = np.abs(ohlcv_close - ohlcv_open)
+    upper_shadows = ohlcv_high - np.maximum(ohlcv_open, ohlcv_close)
+    lower_shadows = np.minimum(ohlcv_open, ohlcv_close) - ohlcv_low
+    shadow_ratio  = (upper_shadows + lower_shadows) / (body_sizes + 1e-8)
+    avg_shadow_ratio = float(np.mean(shadow_ratio))
+    avg_body_pct = float(np.mean(body_sizes / start_price * 100))
+    direction_consistency = float(np.mean(
+        np.sign(ohlcv_close[1:] - ohlcv_close[:-1]) ==
+        np.sign(result.median_path[1:] - result.median_path[:-1])
+    ))
+
     print()
     print("=" * 60)
-    print("  VERBOSE DIAGNOSTICS (v5)")
+    print("  VERBOSE DIAGNOSTICS (v6)")
     print("=" * 60)
 
     print(f"\n[資料概況]")
@@ -156,17 +173,32 @@ def print_diagnostics(
     print(f"  lookback      : {args.lookback} bars")
     print(f"  forecast      : {T} bars")
     print(f"  start_price   : {start_price:.4f}")
-    print(f"  actual_end    : {actual_end:.4f}  ({actual_chg:+.2f}%)" if actual_end else "  actual_end    : N/A")
+    if actual_end:
+        print(f"  actual_end    : {actual_end:.4f}  ({actual_chg:+.2f}%)")
     print(f"  median_end    : {median_end:.4f}  ({median_chg:+.2f}%)")
     print(f"  p10_end       : {p10_end:.4f}")
     print(f"  p90_end       : {p90_end:.4f}")
 
     print(f"\n[帶子中心偏移分析]")
     if center_bias is not None:
-        direction = "↑ median 高低估(帶子心線偏高)→ 考慮降低 drift_scale" if center_bias > 0 \
-                    else "↓ median 低估(帶子心線偏低) → 考慮提高 drift_scale"
-        print(f"  center_bias   : {center_bias:+.2f}%  {direction}")
-    print(f"  band_width_p10_90 : {band_width:.2f}%  (判斷: >{T*0.5:.0f}% 為寬帶, <{T*0.2:.0f}% 為窄帶)")
+        direction = (
+            "\u2191 median 高低估(帶子心線偏高) \u2192 考慮降低 drift_scale"
+            if center_bias > 0 else
+            "\u2193 median 低估(帶子心線偏低) \u2192 考慮提高 drift_scale"
+        )
+        print(f"  center_bias        : {center_bias:+.2f}%  {direction}")
+    print(f"  band_width_p10_90  : {band_width:.2f}%  (判斷: >{T*0.5:.0f}% 為寬帶, <{T*0.2:.0f}% 為窄帶)")
+
+    print(f"\n[K 棒形態診斷]")
+    print(f"  avg_body_pct       : {avg_body_pct:.3f}%  (建議: 0.3~1.5%, 過小表示 K 棒太平)")
+    print(f"  avg_shadow_ratio   : {avg_shadow_ratio:.2f}   (建議: 0.5~2.0, 過大表示影線太多)")
+    if avg_shadow_ratio > 2.5:
+        print(f"  \u26a0 影線過多: --intra-bar 改為 2~4, 或 --shadow-noise 減小")
+    elif avg_shadow_ratio < 0.3:
+        print(f"  \u26a0 影線過少: --shadow-noise 可適度增加")
+    if avg_body_pct < 0.2:
+        print(f"  \u26a0 K 棒實體太小(路徑過平): --intra-bar 降低 或 --drift-scale 提高")
+    print(f"  direction_consist  : {direction_consistency:.2f}   (高表示 K 棒方向跟 median 一致)")
 
     print(f"\n[漬動對照]")
     print(f"  theta.drift             : {theta.drift*100:+.4f}%/day")
@@ -174,8 +206,8 @@ def print_diagnostics(
     print(f"  hist_drift_20d          : {hist_drift_20*100:+.4f}%/day")
     if hist_drift_60:
         print(f"  hist_drift_60d          : {hist_drift_60*100:+.4f}%/day")
-    print(f"  hist_drift_all({args.lookback}d)  : {hist_drift_all*100:+.4f}%/day")
-    print(f"  median_daily_drift      : {median_daily_drift*100:+.4f}%/day  (實際模擬出來的)")
+    print(f"  hist_drift_all({args.lookback:3d}d)  : {hist_drift_all*100:+.4f}%/day")
+    print(f"  median_daily_drift      : {median_daily_drift*100:+.4f}%/day  (實際模擬)")
     if actual_daily_drift:
         print(f"  actual_daily_drift      : {actual_daily_drift*100:+.4f}%/day  (實際後續)")
         drift_gap = (median_daily_drift - actual_daily_drift) * 100
@@ -200,57 +232,52 @@ def print_diagnostics(
     print(f"  drift_decay    : {args.drift_decay}  (t30 殘餘: {np.exp(-args.drift_decay*30)*100:.1f}%)")
     print(f"  anchor_weight  : {args.anchor_weight}")
     print(f"  backbone_mr    : {args.backbone_mr}")
-    print(f"  n_paths        : {args.n_paths}")
     print(f"  intra_bar      : {args.intra_bar}")
+    print(f"  shadow_noise   : {args.shadow_noise}")
+    print(f"  momentum_boost : {args.momentum_boost}")
+    print(f"  path_spread    : {args.path_spread}")
+    print(f"  n_paths        : {args.n_paths}")
 
     print(f"\n[表現指標]")
     for k, v in metrics.items():
         flag = ""
         if k == "hit_rate_10_90":
-            if v >= 0.7:   flag = " ✅ 好"
-            elif v >= 0.5: flag = " ⚠ 可接受"
-            else:          flag = " ❌ 帶子太窄"
+            flag = " \u2705 好" if v >= 0.7 else (" \u26a0 可接受" if v >= 0.5 else " \u274c 帶子太窄")
         if k == "hit_rate_25_75":
-            if v >= 0.4:   flag = " ✅ 好"
-            elif v >= 0.25: flag = " ⚠ 可接受"
-            else:           flag = " ❌ 帶子心線偏差"
+            flag = " \u2705 好" if v >= 0.4 else (" \u26a0 可接受" if v >= 0.25 else " \u274c 帶子心線偏差")
         if k == "direction_acc":
-            if v >= 0.6:   flag = " ✅ 好"
-            elif v >= 0.5: flag = " ⚠ 遠於隨機"
-            else:          flag = " ❌ 差於擲母(中心線方向错)"
+            flag = " \u2705 好" if v >= 0.6 else (" \u26a0 遠於隨機" if v >= 0.5 else " \u274c 差於擲母(中心線方向错)")
         if k == "bars_above_p90" and isinstance(v, int):
             pct = v / max(metrics.get("n_compared", 30), 1)
-            if pct > 0.3:  flag = f" ❌ 帶子偶尔偏低({pct:.0%})"
+            if pct > 0.3: flag = f" \u274c 帶子偶尔偏低({pct:.0%})"
         if k == "bars_below_p10" and isinstance(v, int):
             pct = v / max(metrics.get("n_compared", 30), 1)
-            if pct > 0.3:  flag = f" ❌ 帶子偶尔偏高({pct:.0%})"
+            if pct > 0.3: flag = f" \u274c 帶子偶尔偏高({pct:.0%})"
         print(f"  {k:25s}: {v}{flag}")
 
-    # 自動建議
     print(f"\n[自動建議]")
     suggestions = []
-
     if metrics.get("hit_rate_10_90", 0) < 0.5:
-        suggestions.append("  • 帶子太窄: 嘗試 --vol-multiplier +0.3 或 --recent-vol-window 縮小")
+        suggestions.append("  \u2022 帶子太窄: 嘗試 --vol-multiplier +0.3 或減小 --recent-vol-window")
     if metrics.get("hit_rate_10_90", 0) > 0.95 and metrics.get("hit_rate_25_75", 0) < 0.25:
-        suggestions.append("  • 帶子寬但中心線偏差: 調整 drift_scale 是首要任務")
+        suggestions.append("  \u2022 帶子寬但中心線偏差: 調整 drift_scale 是首要任務")
     if center_bias is not None:
         if center_bias > 3.0:
             new_ds = round(args.drift_scale * 0.6, 2)
-            suggestions.append(f"  • median 明顯偏高 {center_bias:+.1f}%: --drift-scale {new_ds} (當前 {args.drift_scale} 降至 {new_ds})")
+            suggestions.append(f"  \u2022 median 明顯偏高 {center_bias:+.1f}%: --drift-scale {new_ds}")
         elif center_bias < -3.0:
-            new_ds = round(min(args.drift_scale * 1.5, 1.5), 2)
-            suggestions.append(f"  • median 明顯偏低 {center_bias:+.1f}%: --drift-scale {new_ds} (當前 {args.drift_scale} 提至 {new_ds})")
-        elif abs(center_bias) <= 3.0:
-            suggestions.append(f"  • 帶子中心線偏移 {center_bias:+.1f}% (小於 3%，可接受)")
-    if metrics.get("direction_acc", 1) < 0.5:
-        if actual_daily_drift and actual_daily_drift > 0 and median_daily_drift < 0:
-            suggestions.append("  • 方向完全相反: 試試 --drift-scale 0.8 或檢查 backbone 最後一段是否是下降段")
+            new_ds = round(min(args.drift_scale * 1.4, 1.8), 2)
+            suggestions.append(f"  \u2022 median 明顯偏低 {center_bias:+.1f}%: --drift-scale {new_ds}")
         else:
-            suggestions.append("  • 方向准確度差: 考慮調整 --drift-decay 或 --anchor-weight")
+            suggestions.append(f"  \u2022 帶子中心線偏移 {center_bias:+.1f}% (小於 3%，可接受)")
+    if metrics.get("direction_acc", 1) < 0.5:
+        suggestions.append("  \u2022 方向准確度差: 嘗試 --momentum-boost 1.5 或 --anchor-weight 0.4")
+    if avg_shadow_ratio > 2.5:
+        suggestions.append(f"  \u2022 影緜過多({avg_shadow_ratio:.1f}x): --intra-bar {max(2, args.intra_bar - 2)} 或 --shadow-noise {max(0.1, round(args.shadow_noise - 0.15, 2))}")
+    if avg_body_pct < 0.2:
+        suggestions.append(f"  \u2022 K 棒實體太小({avg_body_pct:.3f}%): --intra-bar {max(2, args.intra_bar - 2)} 或 --drift-scale {round(args.drift_scale + 0.2, 2)}")
     if not suggestions:
-        suggestions.append("  • 目前參數已處於較好狀態，可繼續微調")
-
+        suggestions.append("  \u2022 目前參數已處於較好狀態，可繼續微調")
     for s in suggestions:
         print(s)
     print("=" * 60)
@@ -278,28 +305,26 @@ def main():
     estimate_df   = df.iloc[train_end_idx - ESTIMATOR_LB: train_end_idx]
     future_df     = df.iloc[train_end_idx: train_end_idx + args.forecast]
 
-    close_hist  = train_df["Close"].values
-    start_price = float(close_hist[-1])
-
-    hist_open   = train_df["Open"].values.astype(float)
-    hist_high   = train_df["High"].values.astype(float)
-    hist_low    = train_df["Low"].values.astype(float)
-    hist_close  = close_hist
-    hist_volume = train_df["Volume"].values.astype(float)
+    close_hist       = train_df["Close"].values
+    start_price      = float(close_hist[-1])
+    hist_open        = train_df["Open"].values.astype(float)
+    hist_high        = train_df["High"].values.astype(float)
+    hist_low         = train_df["Low"].values.astype(float)
+    hist_close       = close_hist
+    hist_volume      = train_df["Volume"].values.astype(float)
     hist_volume_norm = hist_volume / (hist_volume.mean() + 1e-8)
 
-    actual_close  = future_df["Close"].values.astype(float)
-    actual_open   = future_df["Open"].values.astype(float)
-    actual_high   = future_df["High"].values.astype(float)
-    actual_low    = future_df["Low"].values.astype(float)
-    actual_volume = future_df["Volume"].values.astype(float)
+    actual_close       = future_df["Close"].values.astype(float)
+    actual_open        = future_df["Open"].values.astype(float)
+    actual_high        = future_df["High"].values.astype(float)
+    actual_low         = future_df["Low"].values.astype(float)
+    actual_volume      = future_df["Volume"].values.astype(float)
     actual_volume_norm = actual_volume / (hist_volume.mean() + 1e-8)
 
     print(f"Train end: {start_price:.2f}  forecast={args.forecast} bars")
 
     fitter    = BackboneFitter(n_seg=args.n_seg, smooth_reg=args.smooth_reg)
     bb_result = fitter.fit(close_hist)
-
     last_drift = float(bb_result.segment_drifts[-1])
     last_vol   = float(bb_result.segment_vols[-1])
     drift_fwd  = np.full(args.forecast, last_drift)
@@ -309,27 +334,31 @@ def main():
     rv = recent_realized_vol(close_hist, args.recent_vol_window)
     vol_scale = float(np.clip(
         rv / max(theta.vol, 1e-8),
-        args.vol_scale_min,
-        args.vol_scale_max,
+        args.vol_scale_min, args.vol_scale_max,
     ))
 
     vol_fwd_scaled = vol_fwd * args.vol_multiplier
 
     estimator   = MarketParameterEstimator(lookback=ESTIMATOR_LB, vp_bins=40, momentum_window=10)
     base_params = estimator.fit(estimate_df, symbol=args.symbol)
-    params_fwd  = dataclasses.replace(base_params, last_close=start_price,
-                                      momentum_bias=0.0, node_breakout_state=0)
-    params_fwd  = build_params_from_theta(theta, params_fwd)
+    params_fwd  = dataclasses.replace(
+        base_params, last_close=start_price,
+        momentum_bias=0.0, node_breakout_state=0
+    )
+    params_fwd = build_params_from_theta(theta, params_fwd)
+
+    # v6: momentum_boost 偍作用於 theta.momentum_strength
+    effective_momentum = theta.momentum_strength * args.momentum_boost
 
     sim = USStockFutureSimulator(
         params=params_fwd,
         forecast_steps=args.forecast,
         n_paths=args.n_paths,
         seed=args.seed,
-        vol_scale=vol_scale,
+        vol_scale=vol_scale * args.path_spread,   # path_spread 調整路徑散度
         mr_coeff=theta.mr_coeff,
         node_coeff=theta.node_coeff,
-        momentum_strength=theta.momentum_strength,
+        momentum_strength=effective_momentum,
         momentum_decay=theta.momentum_decay,
         breakout_boost=theta.breakout_boost,
         drift_schedule=drift_fwd,
@@ -350,7 +379,6 @@ def main():
         start_price=start_price,
     )
 
-    # v5 詳細 log
     print_diagnostics(
         args=args, theta=theta,
         close_hist=close_hist, actual_close=actual_close,
@@ -386,7 +414,6 @@ def main():
         m = min(len(actual_close), len(result.median_path))
         actual_deviation = (actual_close[:m] - result.median_path[:m]) / start_price * 100
 
-    # 標題：简潔版
     hit_str = ""
     if metrics:
         hit_str = (
@@ -397,9 +424,10 @@ def main():
             f"  end_err={metrics['end_error_pct']:.2f}%"
         )
     title = (
-        f"{args.symbol} | v5 | lookback={args.lookback}  forecast={args.forecast}  start={start_price:.2f}\n"
+        f"{args.symbol} | v6 | intra={args.intra_bar}  ds={args.drift_scale}"
+        f"  mb={args.momentum_boost}  sn={args.shadow_noise}\n"
         f"rv={rv:.4f}  vol_scale={vol_scale:.2f}  vol_x={args.vol_multiplier}"
-        f"  ds={args.drift_scale}  decay={args.drift_decay}" + hit_str
+        f"  spread={args.path_spread}" + hit_str
     )
 
     fwd_volume_norm = result.ohlcv_volume / (result.ohlcv_volume.mean() + 1e-8)
@@ -427,7 +455,7 @@ def main():
     )
     plt.close(fig)
 
-    print(f"\n✔ Forward study v5 完成")
+    print(f"\n\u2714 Forward study v6 完成")
     print(f"  K 棒圖 : {chart_path}")
     print(f"  指標   : {metrics_path}")
 
