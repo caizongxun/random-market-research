@@ -5,6 +5,13 @@ v9 修正：
   1. 傳送 median_path 到 render_forecast_candles （黃線才會顯示）
   2. 加入 body_scale 機制：當 avg_body_pct > 1.5% 時自動縮小 K 棒實體至目標範圍
   3. GARCH 波動率預測（GJR-GARCH-t）
+
+v9.1 新增：
+  4. --start-date / --end-date：指定任意歷史時段測試
+     例: --start-date 2024-01-03 --end-date 2025-01-01
+     系統會自動以 end-date 為預測起點，往前取 lookback 根做訓練，
+     往後取 forecast 根做驗證（需在 end-date 之後有資料）。
+     不指定時，沿用舊行為（--period 從今天往回）。
 """
 
 from __future__ import annotations
@@ -110,9 +117,15 @@ def parse_args():
     p.add_argument("--garch-model",       default="gjr",
                    choices=["gjr", "garch", "egarch"])
     p.add_argument("--no-garch",          action="store_true")
-    # 新增： K 棒實體縮放上限（防止大紅K）
     p.add_argument("--body-scale-max",    type=float, default=1.5,
-                   help="實體大小上限 (%/day)，超過時自動縮放 vol （預設 1.5%）")
+                   help="實體大小上限 (%%/day)，超過時自動縮放 vol （預設 1.5%%）")
+    # ── v9.1 新增：任意歷史時段 ──────────────────────────────────
+    p.add_argument("--start-date", default=None,
+                   help="資料下載起始日 (YYYY-MM-DD)。與 --end-date 搭配使用，"
+                        "取代 --period。建議比預測起點早至少 600 個交易日。")
+    p.add_argument("--end-date", default=None,
+                   help="預測起點日 (YYYY-MM-DD)。程式以此日最後收盤為 start_price，"
+                        "往前取 lookback 根訓練，往後取 forecast 根驗證。")
     return p.parse_args()
 
 
@@ -244,7 +257,6 @@ def scale_candle_bodies(
     new_open  = mid + (ohlcv_open  - mid) * scale
     new_close = mid + (ohlcv_close - mid) * scale
 
-    # High/Low 也同比縮到中心
     new_high = mid + (ohlcv_high - mid) * scale
     new_low  = mid + (ohlcv_low  - mid) * scale
     new_high = np.maximum(new_high, np.maximum(new_open, new_close))
@@ -476,20 +488,64 @@ def main():
         theta = CalibratedTheta.from_dict(json.load(f))
 
     print(f"Downloading {args.symbol}...")
-    df_raw = yf.download(args.symbol, period=args.period, interval=args.interval,
-                         auto_adjust=False, progress=False)
-    df = ensure_ohlcv(df_raw)
-    print(f"Total bars: {len(df)}")
 
+    # ── v9.1：支援指定歷史時段 ────────────────────────────────────
+    if args.start_date or args.end_date:
+        # 以 end_date 為預測起點，start_date 為資料起始
+        # 若只給 end_date，自動往前推 4 年當 start_date
+        end_dt   = pd.Timestamp(args.end_date) if args.end_date else pd.Timestamp.today()
+        if args.start_date:
+            start_dt = pd.Timestamp(args.start_date)
+        else:
+            start_dt = end_dt - pd.DateOffset(years=4)
+
+        # yfinance end 是 exclusive，加一天確保 end_date 當天資料包含進來
+        # 同時額外多抓 forecast 根的驗證資料
+        dl_end = end_dt + pd.DateOffset(days=args.forecast * 2 + 10)
+        df_raw = yf.download(
+            args.symbol,
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=dl_end.strftime("%Y-%m-%d"),
+            interval=args.interval,
+            auto_adjust=False, progress=False,
+        )
+        df = ensure_ohlcv(df_raw)
+
+        # 找到 end_date 對應的 bar index（取最接近且 <= end_date 的交易日）
+        if "Date" in df.columns:
+            dates = pd.to_datetime(df["Date"])
+        elif "Datetime" in df.columns:
+            dates = pd.to_datetime(df["Datetime"])
+        else:
+            dates = pd.to_datetime(df.iloc[:, 0])
+
+        mask = dates <= end_dt
+        if not mask.any():
+            raise ValueError(f"在 {end_dt.date()} 之前找不到資料，請確認 --start-date 夠早")
+        train_end_idx = int(mask.values.nonzero()[0][-1]) + 1  # inclusive end
+        print(f"Total bars (downloaded): {len(df)}")
+        print(f"Pinned train_end_idx={train_end_idx}  "
+              f"({dates.iloc[train_end_idx-1].date()} 為預測起點)")
+    else:
+        # 舊行為：從今天往回抓 period
+        df_raw = yf.download(args.symbol, period=args.period, interval=args.interval,
+                             auto_adjust=False, progress=False)
+        df = ensure_ohlcv(df_raw)
+        print(f"Total bars: {len(df)}")
+        train_end_idx = len(df) - args.forecast
+
+    # ── 切割資料窗口 ──────────────────────────────────────────────
     ESTIMATOR_LB = 500
-    needed = ESTIMATOR_LB + args.lookback + args.forecast
-    if len(df) < needed:
-        raise ValueError(f"Need {needed} bars, got {len(df)}")
+    needed_before = ESTIMATOR_LB + args.lookback
+    if train_end_idx < needed_before:
+        raise ValueError(
+            f"預測起點前只有 {train_end_idx} 根，需要至少 {needed_before} 根。"
+            f"請將 --start-date 往前移，或縮小 --lookback。"
+        )
 
-    train_end_idx = len(df) - args.forecast
-    train_df      = df.iloc[train_end_idx - args.lookback: train_end_idx]
-    estimate_df   = df.iloc[train_end_idx - ESTIMATOR_LB: train_end_idx]
-    future_df     = df.iloc[train_end_idx: train_end_idx + args.forecast]
+    train_df    = df.iloc[train_end_idx - args.lookback: train_end_idx]
+    estimate_df = df.iloc[train_end_idx - ESTIMATOR_LB:  train_end_idx]
+    future_df   = df.iloc[train_end_idx: train_end_idx + args.forecast]
 
     close_hist       = train_df["Close"].values
     start_price      = float(close_hist[-1])
@@ -524,7 +580,7 @@ def main():
     ))
 
     calib_info   = None
-    calib_window = min(args.calib_window, len(df) - args.forecast)
+    calib_window = min(args.calib_window, train_end_idx)
     calib_df     = df.iloc[train_end_idx - calib_window: train_end_idx]
     use_garch    = args.auto_calibrate and not args.no_garch
 
@@ -661,6 +717,7 @@ def main():
             "calib_window":     args.calib_window,
             "vol_model":        args.garch_model if not args.no_garch else "rv_static",
             "garch_info":       calib_info.get("_garch_info", {}) if calib_info else {},
+            "pinned_end_date":  args.end_date,
         }, f, indent=2)
 
     actual_deviation = None
@@ -678,8 +735,9 @@ def main():
             f"  MAE={metrics['mae_pct']:.2f}%"
             f"  end_err={metrics['end_error_pct']:.2f}%"
         )
+    end_label = f"end={args.end_date}" if args.end_date else "latest"
     title = (
-        f"{args.symbol} | {mode_tag} | ds={args.drift_scale}"
+        f"{args.symbol} | {mode_tag} | {end_label} | ds={args.drift_scale}"
         f"  mb={args.momentum_boost}  dd={args.drift_decay}\n"
         f"rv={rv:.4f}  vol_x={args.vol_multiplier}"
         f"  intra={args.intra_bar}  clamp={args.shadow_clamp}" + hit_str
