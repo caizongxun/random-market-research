@@ -1,11 +1,11 @@
 """
-candle_renderer.py
+candle_renderer.py  v9
 
-將模擬出來的 OHLCV 陣列用 mplfinance 畫成 K 棒圖。
-支援：
-  - 左半段：歷史 K 棒（真實數據）
-  - 右半段：預測 K 棒（intra-bar 模擬）+ 中位數帶子
-  - 下方：逐步偏差柱狀圖
+改動：
+  - 預測 K 棒改為黃金色（漲/跌用不同深淺區分），與历史 K 棒明顯區隔
+  - 中位數路徑改為麮黃線（不再用白色，避免與實際走勢混淡）
+  - 實際走勢線保留白色
+  - 預測區背景加深（讓在視覚上更明顯區分）
 """
 
 from __future__ import annotations
@@ -22,83 +22,104 @@ import mplfinance as mpf
 
 DARK = "#0e0e0e"
 
+# 顠色常數
+COLOR_HIST_UP   = "#26a69a"   # 历史 K 棒漲：青綠
+COLOR_HIST_DN   = "#ef5350"   # 历史 K 棒跌：紅
+COLOR_FWD_UP    = "#ffd54f"   # 預測 K 棒漲：黃金
+COLOR_FWD_DN    = "#ffab40"   # 預測 K 棒跌：深橙
+COLOR_MEDIAN    = "#ffe600"   # 中位數路徑：麮黃
+COLOR_ACTUAL    = "#ffffff"   # 實際走勢：白色
+COLOR_BAND_25_75 = "#00e5ff"  # 帶子顏色
+BAND_ALPHA_INNER = 0.18
+BAND_ALPHA_OUTER = 0.08
+
 
 def _make_ohlcv_df(
-    opens: np.ndarray,
-    highs: np.ndarray,
-    lows: np.ndarray,
-    closes: np.ndarray,
-    volumes: np.ndarray,
-    start_idx: int = 0,
-) -> pd.DataFrame:
-    """建立 mplfinance 需要的 DatetimeIndex OHLCV DataFrame"""
-    n  = len(closes)
-    idx = pd.date_range(start="2020-01-01", periods=start_idx + n, freq="B")  # 工作日
-    df = pd.DataFrame(
+    opens, highs, lows, closes, volumes, start_idx=0
+):
+    n   = len(closes)
+    idx = pd.date_range(start="2020-01-01", periods=start_idx + n, freq="B")
+    return pd.DataFrame(
         {"Open": opens, "High": highs, "Low": lows,
          "Close": closes, "Volume": volumes},
         index=idx[start_idx:],
     )
-    return df
+
+
+def _draw_forecast_candles(
+    ax,
+    x_start: int,
+    fwd_open, fwd_high, fwd_low, fwd_close,
+    color_up=COLOR_FWD_UP,
+    color_dn=COLOR_FWD_DN,
+    alpha_body=0.85,
+    alpha_wick=0.7,
+    lw_wick=0.9,
+):
+    """
+    在 ax 上手動畫預測 K 棒（黃金色）。
+    mplfinance 不支援對不同區段設定不同顏色，所以用 patches 手畫。
+    """
+    for i, (o, h, l, c) in enumerate(zip(fwd_open, fwd_high, fwd_low, fwd_close)):
+        x   = x_start + i
+        clr = color_up if c >= o else color_dn
+
+        # wick
+        ax.plot([x, x], [l, h], color=clr, lw=lw_wick, alpha=alpha_wick,
+                solid_capstyle="round", zorder=3)
+
+        # body
+        body_bot = min(o, c)
+        body_h   = abs(c - o)
+        if body_h < 1e-10:
+            body_h = (h - l) * 0.01  # doji 最小實體
+        rect = mpatches.FancyBboxPatch(
+            (x - 0.35, body_bot), 0.70, body_h,
+            boxstyle="square,pad=0",
+            linewidth=0,
+            facecolor=clr,
+            alpha=alpha_body,
+            zorder=4,
+        )
+        ax.add_patch(rect)
 
 
 def render_forecast_candles(
-    # 歷史歟段（真實）
-    hist_open:   np.ndarray,
-    hist_high:   np.ndarray,
-    hist_low:    np.ndarray,
-    hist_close:  np.ndarray,
-    hist_volume: np.ndarray,
-    # 預測歟段（intra-bar 模擬）
-    fwd_open:    np.ndarray,
-    fwd_high:    np.ndarray,
-    fwd_low:     np.ndarray,
-    fwd_close:   np.ndarray,
-    fwd_volume:  np.ndarray,
-    # 模擬帶子（基於 median_path）
-    p25: np.ndarray,
-    p75: np.ndarray,
-    p10: np.ndarray,
-    p90: np.ndarray,
-    # 實際後續 K 棒（可第 None）
-    actual_open:   Optional[np.ndarray] = None,
-    actual_high:   Optional[np.ndarray] = None,
-    actual_low:    Optional[np.ndarray] = None,
-    actual_close:  Optional[np.ndarray] = None,
-    actual_volume: Optional[np.ndarray] = None,
+    # 历史段
+    hist_open, hist_high, hist_low, hist_close, hist_volume,
+    # 預測段
+    fwd_open, fwd_high, fwd_low, fwd_close, fwd_volume,
+    # 帶子
+    p25, p75, p10, p90,
+    # 中位數路徑（可第 None）
+    median_path: Optional[np.ndarray] = None,
+    # 實際 K 棒（可第 None）
+    actual_open=None, actual_high=None,
+    actual_low=None,  actual_close=None,
+    actual_volume=None,
     # 其他
     title: str = "Forecast Candles",
     output_path: Optional[Path] = None,
     volume_nodes: Optional[list] = None,
-    hist_window: int = 60,   # 顯示歷史幾根（節省畫面）
-    actual_deviation: Optional[np.ndarray] = None,  # 逐步偏差 %
+    hist_window: int = 60,
+    actual_deviation: Optional[np.ndarray] = None,
     metrics: Optional[dict] = None,
 ) -> plt.Figure:
-    """
-    繪制包含預測 K 棒的完整圖表。
-    回傳 Figure。
-    """
-    T_hist = len(hist_close)
-    T_fwd  = len(fwd_close)
+
+    T_hist     = len(hist_close)
+    T_fwd      = len(fwd_close)
     has_actual = actual_close is not None and len(actual_close) > 0
+    show_hist  = min(hist_window, T_hist)
+    sl         = slice(T_hist - show_hist, T_hist)
 
-    # 只顯示最後 hist_window 根歷史
-    show_hist = min(hist_window, T_hist)
-    sl = slice(T_hist - show_hist, T_hist)
-
-    h_o = hist_open[sl]
-    h_h = hist_high[sl]
-    h_l = hist_low[sl]
-    h_c = hist_close[sl]
+    h_o = hist_open[sl];   h_h = hist_high[sl]
+    h_l = hist_low[sl];    h_c = hist_close[sl]
     h_v = hist_volume[sl]
 
-    # 建立欷期：歷史 + 預測 + 實際（同一連續工作日序列）
-    n_total = show_hist + T_fwd
+    n_total  = show_hist + T_fwd
     idx_full = pd.date_range(start="2020-01-01", periods=n_total, freq="B")
-    idx_hist = idx_full[:show_hist]
-    idx_fwd  = idx_full[show_hist:]
 
-    # 整合为單一 DataFrame
+    # 建立單一 DataFrame（預測段用小實體占位，真正 K 棒手畫）
     all_open   = np.concatenate([h_o, fwd_open])
     all_high   = np.concatenate([h_h, fwd_high])
     all_low    = np.concatenate([h_l, fwd_low])
@@ -111,116 +132,94 @@ def render_forecast_candles(
         index=idx_full,
     )
 
-    # mplfinance 自訂樣式
+    # ── mplfinance 樣式（歷史 K 棒顏色）──
     mc = mpf.make_marketcolors(
-        up="#26a69a", down="#ef5350",
-        wick={"up": "#26a69a", "down": "#ef5350"},
-        volume={"up": "#26a69a88", "down": "#ef535088"},
+        up=COLOR_HIST_UP, down=COLOR_HIST_DN,
+        wick={"up": COLOR_HIST_UP, "down": COLOR_HIST_DN},
+        volume={"up": COLOR_HIST_UP + "88", "down": COLOR_HIST_DN + "88"},
         edge="inherit",
     )
-    fwd_mc = mpf.make_marketcolors(
-        up="#ffd54f", down="#ff8a65",   # 預測 K 棒用暖色區分
-        wick={"up": "#ffd54f", "down": "#ff8a65"},
-        volume={"up": "#ffd54f55", "down": "#ff8a6555"},
-        edge="inherit",
-    )
-
     style = mpf.make_mpf_style(
         base_mpf_style="nightclouds",
         marketcolors=mc,
-        facecolor=DARK,
-        edgecolor="#333",
-        figcolor=DARK,
-        gridcolor="#1e1e1e",
-        gridstyle="-",
-        y_on_right=True,
+        facecolor=DARK, edgecolor="#333", figcolor=DARK,
+        gridcolor="#1e1e1e", gridstyle="-", y_on_right=True,
     )
 
-    # 建立帶子 addplot
-    band_x = np.full(n_total, np.nan)
-    band_x[show_hist:] = 1.0  # 占位用
+    # ── addplot：帶子 + 中位數線 + 實際線 ──
+    def _full(arr):
+        out = np.full(n_total, np.nan)
+        out[show_hist:show_hist + len(arr)] = arr
+        return out
 
     ap_list = []
 
     # 25-75% 帶子
-    p25_full = np.full(n_total, np.nan)
-    p75_full = np.full(n_total, np.nan)
-    p10_full = np.full(n_total, np.nan)
-    p90_full = np.full(n_total, np.nan)
-    p25_full[show_hist:show_hist + len(p25)] = p25
-    p75_full[show_hist:show_hist + len(p75)] = p75
-    p10_full[show_hist:show_hist + len(p10)] = p10
-    p90_full[show_hist:show_hist + len(p90)] = p90
+    p25_f = _full(p25); p75_f = _full(p75)
+    p10_f = _full(p10); p90_f = _full(p90)
+    ap_list.append(mpf.make_addplot(
+        p75_f, color=COLOR_BAND_25_75, alpha=0.5, width=1.2,
+        fill_between={"y1": p25_f, "y2": p75_f,
+                      "color": COLOR_BAND_25_75, "alpha": BAND_ALPHA_INNER}))
+    ap_list.append(mpf.make_addplot(
+        p90_f, color=COLOR_BAND_25_75, alpha=0.25, width=0.8,
+        fill_between={"y1": p10_f, "y2": p90_f,
+                      "color": COLOR_BAND_25_75, "alpha": BAND_ALPHA_OUTER}))
+    ap_list.append(mpf.make_addplot(p25_f, color=COLOR_BAND_25_75, alpha=0.5, width=1.2))
+    ap_list.append(mpf.make_addplot(p10_f, color=COLOR_BAND_25_75, alpha=0.25, width=0.8))
 
-    ap_list.append(mpf.make_addplot(p75_full, color="#00e5ff", alpha=0.5, width=1.2,
-                                    fill_between={"y1": p25_full, "y2": p75_full,
-                                                  "color": "#00e5ff", "alpha": 0.18}))
-    ap_list.append(mpf.make_addplot(p90_full, color="#00e5ff", alpha=0.25, width=0.8,
-                                    fill_between={"y1": p10_full, "y2": p90_full,
-                                                  "color": "#00e5ff", "alpha": 0.08}))
-    ap_list.append(mpf.make_addplot(p25_full, color="#00e5ff", alpha=0.5, width=1.2))
-    ap_list.append(mpf.make_addplot(p10_full, color="#00e5ff", alpha=0.25, width=0.8))
+    # 麮黃中位數線
+    if median_path is not None:
+        med_f = _full(median_path)
+        ap_list.append(mpf.make_addplot(
+            med_f, color=COLOR_MEDIAN, width=2.2, alpha=0.92, zorder=6))
 
-    # 實際 K 棒吊層（如果有）
+    # 白色實際走勢線
     if has_actual:
-        n_act = min(len(actual_close), T_fwd)
-        act_o = np.full(n_total, np.nan)
-        act_h = np.full(n_total, np.nan)
-        act_l = np.full(n_total, np.nan)
-        act_c = np.full(n_total, np.nan)
-        act_o[show_hist:show_hist + n_act] = actual_open[:n_act]
-        act_h[show_hist:show_hist + n_act] = actual_high[:n_act]
-        act_l[show_hist:show_hist + n_act] = actual_low[:n_act]
-        act_c[show_hist:show_hist + n_act] = actual_close[:n_act]
-        # 實際 K 棒用白色线条表示（避免覆蓋預測 K 棒）
-        ap_list.append(mpf.make_addplot(act_c, color="white", width=1.8,
-                                         type="line", alpha=0.9))
+        n_act  = min(len(actual_close), T_fwd)
+        act_c  = _full(actual_close[:n_act])
+        ap_list.append(mpf.make_addplot(
+            act_c, color=COLOR_ACTUAL, width=1.8, alpha=0.9, zorder=7))
 
-    # --- 繪制 ---
-    n_panels = 2 if actual_deviation is not None else 1
-    ratios   = (3, 1) if n_panels == 2 else None
-
+    # ── 繪製 ──
     fig, axes = mpf.plot(
-        df_all,
-        type="candle",
-        style=style,
-        addplot=ap_list,
-        volume=True,
-        title=title,
-        returnfig=True,
-        figsize=(18, 10 if n_panels == 2 else 8),
-        tight_layout=False,
-        warn_too_much_data=9999,
+        df_all, type="candle", style=style,
+        addplot=ap_list, volume=True, title=title,
+        returnfig=True, figsize=(18, 10),
+        tight_layout=False, warn_too_much_data=9999,
     )
 
     ax_main = axes[0]
 
-    # 分湋線（歷史 / 預測）
+    # 預測區背景（深色區塊，讓區隔更清楚）
+    ax_main.axvspan(show_hist - 0.5, n_total - 0.5,
+                    color="#1a1200", alpha=0.45, zorder=0)
+
+    # 分界線
     ax_main.axvline(show_hist - 0.5, color="#888", lw=1.2, ls="-", alpha=0.8)
     ax_main.text(show_hist - 0.5, ax_main.get_ylim()[1],
                  "  Forecast", color="#aaa", fontsize=8, va="top")
 
-    # 預測歗殄段淡色背景
-    ax_main.axvspan(show_hist - 0.5, n_total - 0.5,
-                    color="#ffffff", alpha=0.025)
+    # 手畫黃金 K 棒（覆蓋 mplfinance 的預測段）
+    _draw_forecast_candles(
+        ax_main, show_hist,
+        fwd_open, fwd_high, fwd_low, fwd_close,
+    )
 
     # Volume nodes
     if volume_nodes:
         for node in volume_nodes:
             ax_main.axhline(node, color="orange", lw=0.7, alpha=0.25, ls=":")
 
-    # 值願題色調補丁
     ax_main.title.set_color("white")
     ax_main.title.set_fontsize(9)
     fig.patch.set_facecolor(DARK)
-
-    # 对齊円魔
     for ax in axes:
         ax.tick_params(colors="#888")
         ax.yaxis.label.set_color("#888")
         ax.xaxis.label.set_color("#888")
 
-    # 如果有偏差面板
+    # 偏差面板
     if actual_deviation is not None and len(axes) >= 3:
         ax_dev = axes[2]
         ax_dev.set_facecolor(DARK)
