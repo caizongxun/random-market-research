@@ -1,19 +1,21 @@
 """
-us_equity_simulator.py
+us_equity_simulator.py  v4
 
-v3 新增：條件式模擬（Conditional Simulation）
+新增：drift_schedule / vol_schedule
+  - drift_schedule: shape (forecast_steps,) 的陣列，每步用自己的漂移率
+    若為 None 則退回 base_drift（原行為）
+  - vol_schedule: shape (forecast_steps,) 的陣列，每步用自己的波動率
+    若為 None 則全程用 base_vol（原行為）
 
-前幾步加入動量偏向：
-1. momentum_bias：最近 N 根平均日回報，作為前幾步的願動力向偏移
-2. node_breakout_state：突破上方節點則加挑，被拒則加賣壓
-3. vol_trend：波動放大中則放大模擬帶寬
-4. 動量衍减：前幾步的偏向會隨時間指數衍减，讓後半段慡層回歸對稱渴布
+用途：把 BackboneFitter 的分段漂移/殘差波動率注入模擬器，
+讓帶子中線（Median）跟著骨幹方向走，且高波段帶寬大、低波段帶寬小。
 """
 
 from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass
+from typing import Optional
 
 from market_estimator import MarketParams
 
@@ -44,10 +46,12 @@ class USStockFutureSimulator:
         tail_df: int = 5,
         mr_coeff: float = 0.04,
         node_coeff: float = 0.02,
-        # v3 動量參數
-        momentum_strength: float = 0.6,   # 動量偏向的最大倍數
-        momentum_decay: float = 0.75,     # 每步衍减率（指數衍减）
-        breakout_boost: float = 0.4,      # 突破/被拒的額外偏向 (x vol)
+        momentum_strength: float = 0.6,
+        momentum_decay: float = 0.75,
+        breakout_boost: float = 0.4,
+        # v4 新增：分段排程
+        drift_schedule: Optional[np.ndarray] = None,
+        vol_schedule: Optional[np.ndarray] = None,
     ):
         self.params            = params
         self.forecast_steps    = forecast_steps
@@ -61,12 +65,15 @@ class USStockFutureSimulator:
         self.momentum_strength = momentum_strength
         self.momentum_decay    = momentum_decay
         self.breakout_boost    = breakout_boost
+        self.drift_schedule    = drift_schedule  # (T,) or None
+        self.vol_schedule      = vol_schedule    # (T,) or None
 
     def simulate(self) -> SimulationResult:
-        p = self.params
+        p     = self.params
         start = p.last_close
+        T     = self.forecast_steps
 
-        # 選擇 vol 和 drift
+        # --- base drift / vol ---
         if self.use_ewma and hasattr(p, "ewma_vol"):
             base_vol   = p.ewma_vol * self.vol_scale
             base_drift = p.ewma_drift
@@ -74,49 +81,71 @@ class USStockFutureSimulator:
             base_vol   = p.realized_vol * self.vol_scale
             base_drift = p.drift
 
-        # vol_trend 放大：如果波動率正在擴大，帶寬再加大
         vt = getattr(p, "vol_trend", 1.0)
-        base_vol *= min(vt, 2.0)  # 最多放大 2x，避免爆炸
+        base_vol *= min(vt, 2.0)
 
-        # 動量起始偏向
+        # --- per-step drift / vol arrays ---
+        # drift_schedule 優先；否則用 base_drift 填滿
+        if self.drift_schedule is not None:
+            d_arr = np.asarray(self.drift_schedule, dtype=float)
+            if len(d_arr) != T:
+                # 長度不符時做線性插值對齊
+                d_arr = np.interp(
+                    np.linspace(0, 1, T),
+                    np.linspace(0, 1, len(d_arr)),
+                    d_arr,
+                )
+        else:
+            d_arr = np.full(T, base_drift)
+
+        # vol_schedule 優先；否則用 base_vol 填滿
+        if self.vol_schedule is not None:
+            v_arr = np.asarray(self.vol_schedule, dtype=float) * self.vol_scale
+            if len(v_arr) != T:
+                v_arr = np.interp(
+                    np.linspace(0, 1, T),
+                    np.linspace(0, 1, len(v_arr)),
+                    v_arr,
+                )
+            # 保底：不低於 base_vol 的 50%，避免帶子過窄
+            v_arr = np.maximum(v_arr, base_vol * 0.5)
+        else:
+            v_arr = np.full(T, base_vol)
+
+        # --- 動量 / breakout ---
         momentum_bias  = getattr(p, "momentum_bias", 0.0)
         breakout_state = getattr(p, "node_breakout_state", 0)
-
-        # breakout 額外偏向：突破則正，被拒則負
         breakout_extra = breakout_state * self.breakout_boost * base_vol
 
         upper_node, lower_node = self._nearest_nodes(start)
 
-        # 預先生成學生 t 隨機數
-        Z    = self.rng.standard_normal((self.n_paths, self.forecast_steps))
-        chi2 = self.rng.chisquare(
-            df=self.tail_df, size=(self.n_paths, self.forecast_steps)
-        )
+        # --- 隨機數 ---
+        Z    = self.rng.standard_normal((self.n_paths, T))
+        chi2 = self.rng.chisquare(df=self.tail_df, size=(self.n_paths, T))
         t_samples = Z / np.sqrt(chi2 / self.tail_df)
 
-        paths = np.zeros((self.n_paths, self.forecast_steps))
+        paths = np.zeros((self.n_paths, T))
 
         for i in range(self.n_paths):
             price    = start
             prev_ret = 0.0
-            for t in range(self.forecast_steps):
-                # 動量衍减係數：前幾步強，後面歸零
-                decay     = self.momentum_strength * (self.momentum_decay ** t)
+            for t in range(T):
+                step_drift = d_arr[t]
+                step_vol   = v_arr[t]
 
-                noise     = t_samples[i, t] * base_vol
-                # 動量偏向：衍减的 momentum_bias，前幾步有方向性
-                mom_term  = decay * momentum_bias
-                # breakout 突破第一步最強，後面决速衍减
-                bo_term   = breakout_extra * (self.momentum_decay ** (t * 2))
+                decay    = self.momentum_strength * (self.momentum_decay ** t)
+                noise    = t_samples[i, t] * step_vol
+                mom_term = decay * momentum_bias
+                bo_term  = breakout_extra * (self.momentum_decay ** (t * 2))
 
                 trend_term = p.trend_strength * 0.3 * prev_ret
                 mr_term    = -p.mean_reversion_strength * self.mr_coeff * (price / start - 1.0)
                 gap_term   = self.rng.normal(0.0, p.gap_std * 0.15)
-                node_term  = self._volume_node_force(price, base_vol)
-                shock      = self._shock_component(base_vol)
+                node_term  = self._volume_node_force(price, step_vol)
+                shock      = self._shock_component(step_vol)
 
-                ret   = base_drift + noise + mom_term + bo_term + trend_term + mr_term + gap_term + node_term + shock
-                price = max(0.01, price * (1.0 + ret))
+                ret      = step_drift + noise + mom_term + bo_term + trend_term + mr_term + gap_term + node_term + shock
+                price    = max(0.01, price * (1.0 + ret))
                 prev_ret = ret
                 paths[i, t] = price
 
@@ -126,8 +155,8 @@ class USStockFutureSimulator:
         p75    = np.percentile(paths, 75, axis=0)
         p90    = np.percentile(paths, 90, axis=0)
 
-        bup  = float((paths[:, -1] > upper_node).mean()) if upper_node is not None else 0.0
-        bdn  = float((paths[:, -1] < lower_node).mean()) if lower_node is not None else 0.0
+        bup = float((paths[:, -1] > upper_node).mean()) if upper_node is not None else 0.0
+        bdn = float((paths[:, -1] < lower_node).mean()) if lower_node is not None else 0.0
 
         return SimulationResult(
             future_paths=paths,
@@ -150,20 +179,20 @@ class USStockFutureSimulator:
             float(lower.max()) if len(lower) else None,
         )
 
-    def _volume_node_force(self, price: float, base_vol: float) -> float:
+    def _volume_node_force(self, price: float, step_vol: float) -> float:
         if not self.params.volume_nodes:
             return 0.0
         total = 0.0
         for node, strength in zip(self.params.volume_nodes, self.params.volume_node_strength):
             dist  = (price - node) / node
-            width = max(base_vol * 8, 0.01)
+            width = max(step_vol * 8, 0.01)
             pull  = -dist * np.exp(-(dist ** 2) / (2 * width ** 2))
             total += self.node_coeff * strength * self.params.smart_money_ratio * pull
         return float(total)
 
-    def _shock_component(self, base_vol: float) -> float:
+    def _shock_component(self, step_vol: float) -> float:
         p_shock = 0.008 + 0.025 * (1.0 - self.params.smart_money_ratio)
         if self.rng.random() < p_shock:
             direction = 1.0 if self.rng.random() > 0.5 else -1.0
-            return direction * abs(self.rng.normal(0.0, base_vol * 3.5))
+            return direction * abs(self.rng.normal(0.0, step_vol * 3.5))
         return 0.0
