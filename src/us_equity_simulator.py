@@ -1,13 +1,12 @@
 """
-us_equity_simulator.py  v6
+us_equity_simulator.py  v7
 
-新增：
-  intra_bar_steps : 每根 K 棒内部細分步數（預設 8）
-  模擬完成後：
-    - representative_path  : 距 median_path RMSE 最小的完整路徑（有正常波動）
-    - ohlcv_open/high/low/close/volume : 經由 intra-bar 小步模擬得到的 OHLCV
-      基於 representative_path 的每步 close 做起點，小步用 step_vol/sqrt(intra_bar_steps)
-其餘欄位不變。
+修復：
+  1. Drift 衰減 (drift_decay_rate): drift * exp(-decay_rate * t)
+     讓預測愈往後，drift 貢獻愈小，路徑自然散開而非單方向飛
+  2. Momentum anchor 改為相對預測起點的短期斜率
+     均值回歸目標從「骨幹長期值」微調為「短期動量錨點加權」
+  3. 所有對外接口向下相容（新參數皆有預設值）
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ class SimulationResult:
     breakout_prob_down: float
     nearest_upper_node: float | None
     nearest_lower_node: float | None
-    # v6 新增
+    # v6+
     representative_path: np.ndarray = field(default_factory=lambda: np.array([]))
     ohlcv_open:   np.ndarray = field(default_factory=lambda: np.array([]))
     ohlcv_high:   np.ndarray = field(default_factory=lambda: np.array([]))
@@ -61,6 +60,10 @@ class USStockFutureSimulator:
         backbone_mr_coeff: float = 0.06,
         # v6 intra-bar
         intra_bar_steps: int = 8,
+        # v7 drift 衰減 + anchor
+        drift_decay_rate: float = 0.05,
+        drift_scale: float = 1.0,
+        momentum_anchor_weight: float = 0.3,
     ):
         self.params             = params
         self.forecast_steps     = forecast_steps
@@ -79,6 +82,10 @@ class USStockFutureSimulator:
         self.backbone_schedule  = backbone_schedule
         self.backbone_mr_coeff  = backbone_mr_coeff
         self.intra_bar_steps    = intra_bar_steps
+        # v7
+        self.drift_decay_rate        = drift_decay_rate
+        self.drift_scale             = drift_scale
+        self.momentum_anchor_weight  = momentum_anchor_weight
 
     # ------------------------------------------------------------------ #
     def simulate(self) -> SimulationResult:
@@ -100,7 +107,7 @@ class USStockFutureSimulator:
             arr = np.asarray(arr, dtype=float)
             if len(arr) == T:
                 return arr
-            return np.interp(np.linspace(0,1,T), np.linspace(0,1,len(arr)), arr)
+            return np.interp(np.linspace(0, 1, T), np.linspace(0, 1, len(arr)), arr)
 
         d_arr = _interp(self.drift_schedule, T) if self.drift_schedule is not None else np.full(T, base_drift)
         v_arr = np.maximum(
@@ -109,9 +116,23 @@ class USStockFutureSimulator:
         )
         bb_arr = _interp(self.backbone_schedule, T) if self.backbone_schedule is not None else start * np.cumprod(1 + d_arr)
 
+        # v7: 預先計算每步的 decay 乘數（exponential decay to 0）
+        t_idx   = np.arange(T, dtype=float)
+        decay_w = np.exp(-self.drift_decay_rate * t_idx)  # shape (T,)
+        # 套用 drift_scale + decay
+        d_arr_decayed = d_arr * self.drift_scale * decay_w
+
         momentum_bias  = getattr(p, "momentum_bias",       0.0)
         breakout_state = getattr(p, "node_breakout_state", 0)
         breakout_extra = breakout_state * self.breakout_boost * base_vol
+
+        # v7: momentum anchor = 起點附近的短期斜率（用 bb_arr 前幾步估算）
+        anchor_slope = 0.0
+        if len(bb_arr) >= 5:
+            anchor_slope = float(np.mean(np.diff(np.log(bb_arr[:5]))))
+        # anchor_slope 代表「市場自身認為的短期趨勢」，往後逐漸衰減
+        anchor_decay = np.exp(-self.drift_decay_rate * 2.0 * t_idx)
+        momentum_anchor_term = anchor_slope * anchor_decay * self.momentum_anchor_weight
 
         upper_node, lower_node = self._nearest_nodes(start)
 
@@ -125,17 +146,23 @@ class USStockFutureSimulator:
             price    = start
             prev_ret = 0.0
             for t in range(T):
-                step_drift = d_arr[t]
+                step_drift = d_arr_decayed[t]          # v7: decayed drift
                 step_vol   = v_arr[t]
                 bb_target  = bb_arr[t]
 
-                decay      = self.momentum_strength * (self.momentum_decay ** t)
+                decay_m    = self.momentum_strength * (self.momentum_decay ** t)
                 noise      = t_smp[i, t] * step_vol
-                mom_term   = decay * momentum_bias
+                mom_term   = decay_m * momentum_bias
                 bo_term    = breakout_extra * (self.momentum_decay ** (t * 2))
                 trend_term = p.trend_strength * 0.3 * prev_ret
-                bb_dev     = (price - bb_target) / bb_target
-                mr_term    = -self.backbone_mr_coeff * bb_dev
+
+                # v7: backbone MR 目標加入 momentum anchor 偏移
+                anchor_offset = float(momentum_anchor_term[t])
+                bb_dev    = (price - bb_target) / bb_target
+                # 減弱 backbone MR（避免把路徑硬拉向可能偏高的 backbone）
+                mr_weight = np.exp(-self.drift_decay_rate * 0.5 * t)  # MR 也隨時間減弱
+                mr_term   = -self.backbone_mr_coeff * mr_weight * bb_dev + anchor_offset
+
                 gap_term   = self.rng.normal(0.0, p.gap_std * 0.15)
                 node_term  = self._volume_node_force(price, step_vol)
                 shock      = self._shock_component(step_vol)
@@ -152,10 +179,10 @@ class USStockFutureSimulator:
         p90    = np.percentile(paths, 90, axis=0)
 
         # representative path: RMSE vs median 最小
-        rmse = np.sqrt(np.mean((paths - median[None, :]) ** 2, axis=1))
+        rmse     = np.sqrt(np.mean((paths - median[None, :]) ** 2, axis=1))
         rep_path = paths[int(np.argmin(rmse))]
 
-        # intra-bar OHLCV 從 representative_path 產生
+        # intra-bar OHLCV
         ohlcv = self._build_ohlcv(rep_path, v_arr, start)
 
         bup = float((paths[:, -1] > upper_node).mean()) if upper_node is not None else 0.0
@@ -184,25 +211,15 @@ class USStockFutureSimulator:
         v_arr: np.ndarray,
         start_price: float,
     ) -> dict:
-        """
-        用 intra-bar 小步模擬產生每根 K 棒的 OHLCV。
-        - open[0]  = start_price
-        - open[t]  = close[t-1]（無缺口）
-        - 每根棒內部走 intra_bar_steps 小步，小步用 vol/sqrt(intra_bar_steps)
-        - high = 小步路徑內最大值
-        - low  = 小步路徑內最小值
-        - close由 close_path 指定（讓小步路徑由开盤漂向收盤）
-        - volume 用 log-normal 隨機產生（模擬共識/分歧）
-        """
-        T  = len(close_path)
-        K  = self.intra_bar_steps
-        rng = self.rng  # 共用同一 RNG
+        T   = len(close_path)
+        K   = self.intra_bar_steps
+        rng = self.rng
 
-        o_arr = np.empty(T)
-        h_arr = np.empty(T)
-        l_arr = np.empty(T)
-        c_arr = close_path.copy()
-        v_arr_vol = np.empty(T)
+        o_arr     = np.empty(T)
+        h_arr     = np.empty(T)
+        l_arr     = np.empty(T)
+        c_arr     = close_path.copy()
+        v_arr_out = np.empty(T)
 
         prev_close = start_price
         for t in range(T):
@@ -210,17 +227,14 @@ class USStockFutureSimulator:
             bar_close = c_arr[t]
             intra_vol = v_arr[t] / np.sqrt(K)
 
-            # 小步路徑：從 bar_open 小步漂向 bar_close
-            # drift_intra 讓每小步進度朝 bar_close 移動
             log_target  = np.log(bar_close / bar_open) if bar_open > 0 else 0.0
-            drift_intra = log_target / K  # 線性分配
+            drift_intra = log_target / K
 
-            prices = np.empty(K + 1)
+            prices    = np.empty(K + 1)
             prices[0] = bar_open
             for k in range(K):
                 noise       = rng.normal(0.0, intra_vol)
                 prices[k+1] = max(0.01, prices[k] * np.exp(drift_intra + noise))
-            # 強制最後一步對齊 bar_close（讓 OHLCV 的 C 與路徑一致）
             prices[-1] = bar_close
 
             o_arr[t] = bar_open
@@ -228,17 +242,15 @@ class USStockFutureSimulator:
             l_arr[t] = float(prices.min())
             prev_close = bar_close
 
-            # Volume: log-normal, 大波動棒量大
             bar_ret    = abs(bar_close / bar_open - 1) if bar_open > 0 else 0.0
             vol_factor = np.exp(rng.normal(0.0, 0.6) + bar_ret * 8)
-            v_arr_vol[t] = float(vol_factor)
+            v_arr_out[t] = float(vol_factor)
 
-        # 高低不能倒轉
         h_arr = np.maximum(h_arr, np.maximum(o_arr, c_arr))
         l_arr = np.minimum(l_arr, np.minimum(o_arr, c_arr))
 
         return {"open": o_arr, "high": h_arr, "low": l_arr,
-                "close": c_arr, "volume": v_arr_vol}
+                "close": c_arr, "volume": v_arr_out}
 
     # ------------------------------------------------------------------ #
     def _nearest_nodes(self, price):
