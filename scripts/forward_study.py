@@ -1,14 +1,17 @@
 """
-forward_study.py  v3
+forward_study.py  v4
 
-修復（v3）：
-  1. 新增 --drift-decay   (預設 0.05)  → drift 隨時間指數衰減
-  2. 新增 --drift-scale   (預設 0.5)   → 校準 drift 整體縮放（對抗 lookback 偏差）
-  3. 新增 --anchor-weight (預設 0.3)   → momentum anchor 強度
-  drift-scale 直覺：
-    - 1.0 = 完全信任校準期的 drift（舊行為）
-    - 0.5 = drift 減半（建議起點，lookback 包含大漲時用）
-    - 0.0 = 純隨機漫步（不加 drift）
+修復（v4）：
+  方向 1（治標）: 新增 --vol-multiplier (預設 1.5)
+    → 對整體 vol_schedule 乘以倍率，直接加寬帶子
+  方向 2（治本）: vol_scale 改用最近 recent_vol_window 天的 realized vol 計算
+    → 避免 last_seg_vol 被歷史平靜期低估
+    → vol_scale = clip( recent_vol / theta.vol, vol_scale_min, vol_scale_max )
+  新增參數：
+    --vol-multiplier      (預設 1.5)  直接乘在所有路徑的 vol 上
+    --recent-vol-window   (預設 20)   近期 realized vol 的計算窗口
+    --vol-scale-min       (預設 0.6)  vol_scale 下限保護
+    --vol-scale-max       (預設 3.0)  vol_scale 上限保護
 
 Example:
     python scripts/forward_study.py \\
@@ -17,10 +20,9 @@ Example:
         --lookback 120 --forecast 30 \\
         --seed 42 --n-paths 500 \\
         --backbone-mr 0.06 --n-seg 6 \\
-        --hist-window 60 \\
-        --drift-decay 0.05 \\
-        --drift-scale 0.5 \\
-        --anchor-weight 0.3 \\
+        --hist-window 60 --intra-bar 8 \\
+        --drift-decay 0.05 --drift-scale 0.5 --anchor-weight 0.3 \\
+        --vol-multiplier 1.5 --recent-vol-window 20 \\
         --output results/forward_aapl
 """
 
@@ -50,27 +52,31 @@ DARK = "#0e0e0e"
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--symbol",        required=True)
-    p.add_argument("--theta",         required=True)
-    p.add_argument("--lookback",      type=int,   default=120)
-    p.add_argument("--forecast",      type=int,   default=30)
-    p.add_argument("--seed",          type=int,   default=42)
-    p.add_argument("--n-paths",       type=int,   default=500)
-    p.add_argument("--n-seg",         type=int,   default=6)
-    p.add_argument("--smooth-reg",    type=float, default=0.5)
-    p.add_argument("--backbone-mr",   type=float, default=0.06)
-    p.add_argument("--period",        default="3y")
-    p.add_argument("--interval",      default="1d")
-    p.add_argument("--hist-window",   type=int,   default=60)
-    p.add_argument("--intra-bar",     type=int,   default=8)
-    # v3 新參數
-    p.add_argument("--drift-decay",   type=float, default=0.05,
-                   help="Drift 衰減速率（0=不衰減，0.1=快速衰減）")
-    p.add_argument("--drift-scale",   type=float, default=0.5,
-                   help="Drift 整體縮放（1=原始，0.5=減半，0=純隨機漫步）")
-    p.add_argument("--anchor-weight", type=float, default=0.3,
-                   help="Momentum anchor 強度（0~1）")
-    p.add_argument("--output",        default="forward_study")
+    p.add_argument("--symbol",            required=True)
+    p.add_argument("--theta",             required=True)
+    p.add_argument("--lookback",          type=int,   default=120)
+    p.add_argument("--forecast",          type=int,   default=30)
+    p.add_argument("--seed",              type=int,   default=42)
+    p.add_argument("--n-paths",           type=int,   default=500)
+    p.add_argument("--n-seg",             type=int,   default=6)
+    p.add_argument("--smooth-reg",        type=float, default=0.5)
+    p.add_argument("--backbone-mr",       type=float, default=0.06)
+    p.add_argument("--period",            default="3y")
+    p.add_argument("--interval",          default="1d")
+    p.add_argument("--hist-window",       type=int,   default=60)
+    p.add_argument("--intra-bar",         type=int,   default=8)
+    # v3
+    p.add_argument("--drift-decay",       type=float, default=0.05)
+    p.add_argument("--drift-scale",       type=float, default=0.5)
+    p.add_argument("--anchor-weight",     type=float, default=0.3)
+    # v4 新增
+    p.add_argument("--vol-multiplier",    type=float, default=1.5,
+                   help="所有路徑 vol 額外乘以此倍率（直接加寬帶子，預設 1.5）")
+    p.add_argument("--recent-vol-window", type=int,   default=20,
+                   help="用最近幾天的 realized vol 算 vol_scale（預設 20）")
+    p.add_argument("--vol-scale-min",     type=float, default=0.6)
+    p.add_argument("--vol-scale-max",     type=float, default=4.0)
+    p.add_argument("--output",            default="forward_study")
     return p.parse_args()
 
 
@@ -81,17 +87,13 @@ def ensure_ohlcv(df):
     return df[["Open", "High", "Low", "Close", "Volume"]].dropna().reset_index()
 
 
-def build_schedules(segment_drifts, segment_vols, n_steps):
-    n_seg   = len(segment_drifts)
-    seg_len = n_steps // n_seg
-    d_arr   = np.empty(n_steps)
-    v_arr   = np.empty(n_steps)
-    for s in range(n_seg):
-        lo = s * seg_len
-        hi = lo + seg_len if s < n_seg - 1 else n_steps
-        d_arr[lo:hi] = segment_drifts[s]
-        v_arr[lo:hi] = segment_vols[s]
-    return d_arr, v_arr
+def recent_realized_vol(close_arr: np.ndarray, window: int) -> float:
+    """最近 window 天的日收益率標準差（年化前的日 vol）"""
+    w = min(window, len(close_arr) - 1)
+    if w < 2:
+        return float(np.std(np.diff(np.log(close_arr))))
+    log_rets = np.diff(np.log(close_arr[-w - 1:]))
+    return float(np.std(log_rets))
 
 
 def compute_metrics(actual, median, p25, p75, p10, p90, start_price):
@@ -101,8 +103,8 @@ def compute_metrics(actual, median, p25, p75, p10, p90, start_price):
     act, med  = actual[:n], median[:n]
     hit_25_75 = float(np.mean((act >= p25[:n]) & (act <= p75[:n])))
     hit_10_90 = float(np.mean((act >= p10[:n]) & (act <= p90[:n])))
-    actual_dir   = np.sign(np.diff(np.concatenate([[start_price], act])))
-    median_dir   = np.sign(np.diff(np.concatenate([[start_price], med])))
+    actual_dir    = np.sign(np.diff(np.concatenate([[start_price], act])))
+    median_dir    = np.sign(np.diff(np.concatenate([[start_price], med])))
     direction_acc = float(np.mean(actual_dir == median_dir))
     end_error = float(abs(act[-1] - med[-1]) / start_price * 100)
     mae_pct   = float(np.mean(np.abs(act - med) / start_price * 100))
@@ -126,7 +128,8 @@ def main():
     with open(args.theta) as f:
         theta = CalibratedTheta.from_dict(json.load(f))
     print(f"Loaded theta: vol={theta.vol:.5f}  drift={theta.drift:+.6f}  hurst={theta.hurst_proxy:.3f}")
-    print(f"v3 params:  drift_decay={args.drift_decay}  drift_scale={args.drift_scale}  anchor_weight={args.anchor_weight}")
+    print(f"v3 params: drift_decay={args.drift_decay}  drift_scale={args.drift_scale}  anchor_weight={args.anchor_weight}")
+    print(f"v4 params: vol_multiplier={args.vol_multiplier}  recent_vol_window={args.recent_vol_window}")
 
     print(f"Downloading {args.symbol}...")
     df_raw = yf.download(args.symbol, period=args.period, interval=args.interval,
@@ -144,14 +147,14 @@ def main():
     estimate_df   = df.iloc[train_end_idx - ESTIMATOR_LB: train_end_idx]
     future_df     = df.iloc[train_end_idx: train_end_idx + args.forecast]
 
-    close_hist   = train_df["Close"].values
-    start_price  = float(close_hist[-1])
+    close_hist  = train_df["Close"].values
+    start_price = float(close_hist[-1])
 
-    hist_open    = train_df["Open"].values.astype(float)
-    hist_high    = train_df["High"].values.astype(float)
-    hist_low     = train_df["Low"].values.astype(float)
-    hist_close   = close_hist
-    hist_volume  = train_df["Volume"].values.astype(float)
+    hist_open   = train_df["Open"].values.astype(float)
+    hist_high   = train_df["High"].values.astype(float)
+    hist_low    = train_df["Low"].values.astype(float)
+    hist_close  = close_hist
+    hist_volume = train_df["Volume"].values.astype(float)
     hist_volume_norm = hist_volume / (hist_volume.mean() + 1e-8)
 
     actual_close  = future_df["Close"].values.astype(float)
@@ -163,6 +166,7 @@ def main():
 
     print(f"Train end: {start_price:.2f}  forecast={args.forecast} bars")
 
+    # --- 骨幹 ---
     fitter    = BackboneFitter(n_seg=args.n_seg, smooth_reg=args.smooth_reg)
     bb_result = fitter.fit(close_hist)
     print(f"Backbone MSE={bb_result.fit_mse:.6f}")
@@ -173,8 +177,20 @@ def main():
     vol_fwd    = np.full(args.forecast, last_vol)
     bb_fwd     = start_price * np.cumprod(1 + drift_fwd)
 
-    vol_scale = float(np.clip(theta.vol / max(last_vol, 1e-8), 0.5, 3.0))
-    print(f"vol_scale={vol_scale:.3f}")
+    # --- 方向 2：用近期 realized vol 計算 vol_scale ---
+    rv = recent_realized_vol(close_hist, args.recent_vol_window)
+    # vol_scale = recent_vol / theta.vol (theta.vol 是長期校準值)
+    # 若近期波動大於長期校準，vol_scale > 1，帶子自動加寬
+    vol_scale = float(np.clip(
+        rv / max(theta.vol, 1e-8),
+        args.vol_scale_min,
+        args.vol_scale_max,
+    ))
+    print(f"recent_vol={rv:.5f}  theta.vol={theta.vol:.5f}  vol_scale={vol_scale:.3f} (近期 realized vol 法)")
+
+    # --- 方向 1：vol_multiplier 額外乘在 vol_fwd 上 ---
+    vol_fwd_scaled = vol_fwd * args.vol_multiplier
+    print(f"vol_multiplier={args.vol_multiplier}  effective vol per step = {vol_fwd_scaled[0]*vol_scale:.5f}")
 
     estimator   = MarketParameterEstimator(lookback=ESTIMATOR_LB, vp_bins=40, momentum_window=10)
     base_params = estimator.fit(estimate_df, symbol=args.symbol)
@@ -194,11 +210,10 @@ def main():
         momentum_decay=theta.momentum_decay,
         breakout_boost=theta.breakout_boost,
         drift_schedule=drift_fwd,
-        vol_schedule=vol_fwd,
+        vol_schedule=vol_fwd_scaled,   # <-- v4: 乘上 vol_multiplier
         backbone_schedule=bb_fwd,
         backbone_mr_coeff=args.backbone_mr,
         intra_bar_steps=args.intra_bar,
-        # v3
         drift_decay_rate=args.drift_decay,
         drift_scale=args.drift_scale,
         momentum_anchor_weight=args.anchor_weight,
@@ -221,15 +236,18 @@ def main():
     with open(metrics_path, "w") as f:
         json.dump({
             **metrics,
-            "symbol":        args.symbol,
-            "forecast_steps": args.forecast,
-            "lookback":      args.lookback,
-            "drift_scale":   args.drift_scale,
-            "drift_decay":   args.drift_decay,
-            "start_price":   start_price,
-            "actual_end":    float(actual_close[-1]) if len(actual_close) else None,
-            "median_end":    float(result.median_path[-1]),
-            "rep_end":       float(result.representative_path[-1]),
+            "symbol":           args.symbol,
+            "forecast_steps":   args.forecast,
+            "lookback":         args.lookback,
+            "drift_scale":      args.drift_scale,
+            "drift_decay":      args.drift_decay,
+            "vol_multiplier":   args.vol_multiplier,
+            "recent_vol":       round(rv, 6),
+            "vol_scale":        round(vol_scale, 4),
+            "start_price":      start_price,
+            "actual_end":       float(actual_close[-1]) if len(actual_close) else None,
+            "median_end":       float(result.median_path[-1]),
+            "rep_end":          float(result.representative_path[-1]),
         }, f, indent=2)
 
     actual_deviation = None
@@ -249,8 +267,8 @@ def main():
     title = (
         f"{args.symbol} | Forecast Candles (intra-bar={args.intra_bar}) | "
         f"lookback={args.lookback}  forecast={args.forecast}  start={start_price:.2f}\n"
-        f"vol={theta.vol:.4f}  hurst={theta.hurst_proxy:.3f}  bb_mr={args.backbone_mr:.3f}  "
-        f"vol_scale={vol_scale:.2f}  drift_scale={args.drift_scale}  decay={args.drift_decay}" + hit_str
+        f"vol={theta.vol:.4f}  rv={rv:.4f}  vol_scale={vol_scale:.2f}  "
+        f"vol_x={args.vol_multiplier}  drift_scale={args.drift_scale}  decay={args.drift_decay}" + hit_str
     )
 
     fwd_volume_norm = result.ohlcv_volume / (result.ohlcv_volume.mean() + 1e-8)
@@ -285,7 +303,7 @@ def main():
     )
     plt.close(fig)
 
-    print(f"\n✔ Forward study v3 完成")
+    print(f"\n✔ Forward study v4 完成")
     print(f"  K 棒圖 : {chart_path}")
     print(f"  指標   : {metrics_path}")
 
