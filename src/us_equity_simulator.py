@@ -1,14 +1,15 @@
 """
-us_equity_simulator.py  v4
+us_equity_simulator.py  v5
 
-新增：drift_schedule / vol_schedule
-  - drift_schedule: shape (forecast_steps,) 的陣列，每步用自己的漂移率
-    若為 None 則退回 base_drift（原行為）
-  - vol_schedule: shape (forecast_steps,) 的陣列，每步用自己的波動率
-    若為 None 則全程用 base_vol（原行為）
+新增：
+  1. backbone_schedule  : 每步的骨幹目標價格，mr_term 改往骨幹回歸（非 start_price）
+  2. drift_schedule     : 每步漂移率（v4 保留）
+  3. vol_schedule       : 每步波動率（v4 保留）
 
-用途：把 BackboneFitter 的分段漂移/殘差波動率注入模擬器，
-讓帶子中線（Median）跟著骨幹方向走，且高波段帶寬大、低波段帶寬小。
+效果：
+  - 帶子中線更緊貼骨幹，不再漂離
+  - 低波動段帶寬窄、高波動段帶寬寬
+  - 帶子不會隨時間無限擴散（soft clamp via backbone mean-reversion）
 """
 
 from __future__ import annotations
@@ -49,24 +50,29 @@ class USStockFutureSimulator:
         momentum_strength: float = 0.6,
         momentum_decay: float = 0.75,
         breakout_boost: float = 0.4,
-        # v4 新增：分段排程
+        # v4 分段排程
         drift_schedule: Optional[np.ndarray] = None,
         vol_schedule: Optional[np.ndarray] = None,
+        # v5 骨幹錨點：mr_term 改往骨幹回歸
+        backbone_schedule: Optional[np.ndarray] = None,
+        backbone_mr_coeff: float = 0.06,   # 骨幹回歸強度（比 mr_coeff 略強）
     ):
-        self.params            = params
-        self.forecast_steps    = forecast_steps
-        self.n_paths           = n_paths
-        self.rng               = np.random.default_rng(seed)
-        self.vol_scale         = vol_scale
-        self.use_ewma          = use_ewma
-        self.tail_df           = tail_df
-        self.mr_coeff          = mr_coeff
-        self.node_coeff        = node_coeff
-        self.momentum_strength = momentum_strength
-        self.momentum_decay    = momentum_decay
-        self.breakout_boost    = breakout_boost
-        self.drift_schedule    = drift_schedule  # (T,) or None
-        self.vol_schedule      = vol_schedule    # (T,) or None
+        self.params             = params
+        self.forecast_steps     = forecast_steps
+        self.n_paths            = n_paths
+        self.rng                = np.random.default_rng(seed)
+        self.vol_scale          = vol_scale
+        self.use_ewma           = use_ewma
+        self.tail_df            = tail_df
+        self.mr_coeff           = mr_coeff
+        self.node_coeff         = node_coeff
+        self.momentum_strength  = momentum_strength
+        self.momentum_decay     = momentum_decay
+        self.breakout_boost     = breakout_boost
+        self.drift_schedule     = drift_schedule
+        self.vol_schedule       = vol_schedule
+        self.backbone_schedule  = backbone_schedule
+        self.backbone_mr_coeff  = backbone_mr_coeff
 
     def simulate(self) -> SimulationResult:
         p     = self.params
@@ -84,33 +90,29 @@ class USStockFutureSimulator:
         vt = getattr(p, "vol_trend", 1.0)
         base_vol *= min(vt, 2.0)
 
-        # --- per-step drift / vol arrays ---
-        # drift_schedule 優先；否則用 base_drift 填滿
-        if self.drift_schedule is not None:
-            d_arr = np.asarray(self.drift_schedule, dtype=float)
-            if len(d_arr) != T:
-                # 長度不符時做線性插值對齊
-                d_arr = np.interp(
-                    np.linspace(0, 1, T),
-                    np.linspace(0, 1, len(d_arr)),
-                    d_arr,
-                )
-        else:
-            d_arr = np.full(T, base_drift)
+        # --- per-step arrays ---
+        def _interp(arr, T):
+            arr = np.asarray(arr, dtype=float)
+            if len(arr) == T:
+                return arr
+            return np.interp(
+                np.linspace(0, 1, T),
+                np.linspace(0, 1, len(arr)),
+                arr,
+            )
 
-        # vol_schedule 優先；否則用 base_vol 填滿
-        if self.vol_schedule is not None:
-            v_arr = np.asarray(self.vol_schedule, dtype=float) * self.vol_scale
-            if len(v_arr) != T:
-                v_arr = np.interp(
-                    np.linspace(0, 1, T),
-                    np.linspace(0, 1, len(v_arr)),
-                    v_arr,
-                )
-            # 保底：不低於 base_vol 的 50%，避免帶子過窄
-            v_arr = np.maximum(v_arr, base_vol * 0.5)
+        d_arr = _interp(self.drift_schedule, T) if self.drift_schedule is not None else np.full(T, base_drift)
+        v_arr = np.maximum(
+            _interp(self.vol_schedule, T) * self.vol_scale if self.vol_schedule is not None else np.full(T, base_vol),
+            base_vol * 0.4,
+        )
+
+        # 骨幹目標價格（每步）
+        if self.backbone_schedule is not None:
+            bb_arr = _interp(self.backbone_schedule, T)
         else:
-            v_arr = np.full(T, base_vol)
+            # 退化：骨幹 = start + drift 直線
+            bb_arr = start * np.cumprod(1 + d_arr)
 
         # --- 動量 / breakout ---
         momentum_bias  = getattr(p, "momentum_bias", 0.0)
@@ -120,9 +122,9 @@ class USStockFutureSimulator:
         upper_node, lower_node = self._nearest_nodes(start)
 
         # --- 隨機數 ---
-        Z    = self.rng.standard_normal((self.n_paths, T))
-        chi2 = self.rng.chisquare(df=self.tail_df, size=(self.n_paths, T))
-        t_samples = Z / np.sqrt(chi2 / self.tail_df)
+        Z     = self.rng.standard_normal((self.n_paths, T))
+        chi2  = self.rng.chisquare(df=self.tail_df, size=(self.n_paths, T))
+        t_smp = Z / np.sqrt(chi2 / self.tail_df)
 
         paths = np.zeros((self.n_paths, T))
 
@@ -132,17 +134,22 @@ class USStockFutureSimulator:
             for t in range(T):
                 step_drift = d_arr[t]
                 step_vol   = v_arr[t]
+                bb_target  = bb_arr[t]
 
                 decay    = self.momentum_strength * (self.momentum_decay ** t)
-                noise    = t_samples[i, t] * step_vol
+                noise    = t_smp[i, t] * step_vol
                 mom_term = decay * momentum_bias
                 bo_term  = breakout_extra * (self.momentum_decay ** (t * 2))
 
                 trend_term = p.trend_strength * 0.3 * prev_ret
-                mr_term    = -p.mean_reversion_strength * self.mr_coeff * (price / start - 1.0)
-                gap_term   = self.rng.normal(0.0, p.gap_std * 0.15)
-                node_term  = self._volume_node_force(price, step_vol)
-                shock      = self._shock_component(step_vol)
+
+                # v5 核心改動：mr_term 往骨幹目標回歸
+                bb_dev   = (price - bb_target) / bb_target   # 與骨幹的偏差
+                mr_term  = -self.backbone_mr_coeff * bb_dev
+
+                gap_term  = self.rng.normal(0.0, p.gap_std * 0.15)
+                node_term = self._volume_node_force(price, step_vol)
+                shock     = self._shock_component(step_vol)
 
                 ret      = step_drift + noise + mom_term + bo_term + trend_term + mr_term + gap_term + node_term + shock
                 price    = max(0.01, price * (1.0 + ret))
