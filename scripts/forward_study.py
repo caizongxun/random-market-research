@@ -2,7 +2,7 @@
 forward_study.py  v9  (GJR-GARCH + auto-calibrate)
 
 v9 修正：
-  1. 傳送 median_path 到 render_forecast_candles （麮黃線才會顯示）
+  1. 傳送 median_path 到 render_forecast_candles （黃線才會顯示）
   2. 加入 body_scale 機制：當 avg_body_pct > 1.5% 時自動縮小 K 棒實體至目標範圍
   3. GARCH 波動率預測（GJR-GARCH-t）
 """
@@ -30,7 +30,7 @@ from candle_renderer import render_forecast_candles
 
 
 # ───────────────────────────────────────────────────────────────
-f# GJR-GARCH 波動率預測
+# GJR-GARCH 波動率預測
 # ───────────────────────────────────────────────────────────────
 
 def garch_vol_forecast(
@@ -232,7 +232,7 @@ def scale_candle_bodies(
     """
     當預測 K 棒實體平均超過 target_body_pct 時，
     按比例縮小每根 K 棒的開收距離（中心點不動）。
-    高低跌吜同比例縮小。
+    高低影線同比例縮小。
     """
     body_sizes = np.abs(ohlcv_close - ohlcv_open)
     avg_body_pct = float(np.mean(body_sizes / start_price * 100))
@@ -343,7 +343,7 @@ def print_diagnostics(
             print(f"    \u03b1 (ARCH)       : {gi.get('alpha','?')}")
             print(f"    \u03b3 (槓桿 GJR)    : {gi.get('gamma','?')}  ← 下跌時波動放大")
             print(f"    \u03b2 (GARCH)      : {gi.get('beta','?')}")
-            print(f"    persistence    : {gi.get('persistence','?')}  (α+β+0.5\u03b3, <1=穩定)")
+            print(f"    persistence    : {gi.get('persistence','?')}  (\u03b1+\u03b2+0.5\u03b3, <1=穩定)")
             print(f"    forecast \u03c3/day : {gi.get('forecast_vol_pct','?')}%  → vol_multiplier={args.vol_multiplier}")
             print(f"    rv/theta (靜態): {calib_info['_rv_pct']:.4f}%/{theta.vol*100:.4f}%  → {rv_vm} (備用)")
         else:
@@ -352,7 +352,7 @@ def print_diagnostics(
             print(f"  vol_source           : rv_fallback  (garch 失敗: {err})")
         print(f"  last_seg / hist_all  : {calib_info['_last_seg_drift']:+.4f}% / {calib_info['_hist_drift_all']:+.4f}%  → drift_scale={args.drift_scale}")
         if body_scale_applied:
-            print(f"  body_scale           : applied ✅ (實體縮至 ~{args.body_scale_max:.1f}%)")
+            print(f"  body_scale           : applied \u2705 (實體縮至 ~{args.body_scale_max:.1f}%)")
 
     print(f"\n[資料概況]")
     print(f"  symbol        : {args.symbol}")
@@ -373,7 +373,7 @@ def print_diagnostics(
         )
         flag = " \u2705" if abs(center_bias) <= 3 else " \u274c"
         print(f"  center_bias        : {center_bias:+.2f}%  {direction}{flag}")
-    print(f"  band_width_p10_90  : {band_width:.2f}%  (判斷: >{T*0.5:.0f}%=对, <{T*0.2:.0f}%=窄)")
+    print(f"  band_width_p10_90  : {band_width:.2f}%  (判斷: >{T*0.5:.0f}%=寬, <{T*0.2:.0f}%=窄)")
 
     print(f"\n[K 棒形態診斷]")
     status_body = " \u2705" if 0.3 <= avg_body_pct <= 1.5 else (" \u26a0 太大" if avg_body_pct > 1.5 else " \u274c 太小")
@@ -530,7 +530,7 @@ def main():
 
     if args.auto_calibrate:
         model_label = "disabled" if args.no_garch else args.garch_model.upper()
-        print(f"\n[auto-calibrate v9] 揃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
+        print(f"\n[auto-calibrate v9] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             calib_df, window=calib_window,
             theta_vol=theta.vol, last_seg_drift=last_drift,
@@ -696,7 +696,7 @@ def main():
         fwd_volume=fwd_volume_norm,
         p25=result.p25, p75=result.p75,
         p10=result.p10, p90=result.p90,
-        median_path=result.median_path,          # ← 麮黃線！之前漏傳這個
+        median_path=result.median_path,
         actual_open=actual_open   if len(actual_close) > 0 else None,
         actual_high=actual_high   if len(actual_close) > 0 else None,
         actual_low=actual_low     if len(actual_close) > 0 else None,
