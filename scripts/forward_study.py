@@ -1,14 +1,10 @@
 """
 forward_study.py  v9  (GJR-GARCH + auto-calibrate)
 
-新增 Phase 1+2 波動率模型升級：
-  vol_multiplier 不再用 rv/theta 靜態比值，
-  改用 GJR-GARCH(1,1,1)-t 預測的 1-step-ahead σ。
-  - 若 arch 未安裝 → 自動 fallback 回 rv/theta 靜態比值
-  - --garch-model  : 'gjr' (預設) | 'garch' | 'egarch'
-  - --no-garch     : 強制關閉，退回靜態 rv/theta
-
-v8 的 --auto-calibrate 其餘邏輯不變。
+v9 修正：
+  1. 傳送 median_path 到 render_forecast_candles （麮黃線才會顯示）
+  2. 加入 body_scale 機制：當 avg_body_pct > 1.5% 時自動縮小 K 棒實體至目標範圍
+  3. GARCH 波動率預測（GJR-GARCH-t）
 """
 
 from __future__ import annotations
@@ -33,77 +29,54 @@ from us_equity_simulator import USStockFutureSimulator
 from candle_renderer import render_forecast_candles
 
 
-# ─────────────────────────────────────────────────────────────
-# GJR-GARCH 波動率預測（Phase 1+2）
-# ─────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
+f# GJR-GARCH 波動率預測
+# ───────────────────────────────────────────────────────────────
 
 def garch_vol_forecast(
     close_arr: np.ndarray,
     model_type: str = "gjr",
 ) -> tuple[float, dict]:
-    """
-    用 GJR-GARCH(1,1,1)-t 預測明日 1-step-ahead σ (日標準差)。
-
-    Parameters
-    ----------
-    close_arr  : 收盤價陣列（用於計算對數報酬）
-    model_type : 'gjr' | 'garch' | 'egarch'
-
-    Returns
-    -------
-    forecast_vol : float  — 預測波動率（日標準差，比例形式）
-    info         : dict   — 診斷資訊
-    """
     try:
         from arch import arch_model
     except ImportError:
         return None, {"error": "arch not installed"}
-
     try:
-        rets = pd.Series(np.diff(np.log(close_arr)) * 100)  # 百分比報酬
+        rets = pd.Series(np.diff(np.log(close_arr)) * 100)
         rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
         if len(rets) < 60:
             return None, {"error": "too few returns"}
-
         if model_type == "gjr":
-            # GJR-GARCH(1,1,1) with Student-t errors
-            # o=1 捕捉槓桿效應：下跌時波動率放大幅度 > 上漲
             am = arch_model(rets, vol="Garch", p=1, o=1, q=1, dist="t")
         elif model_type == "egarch":
             am = arch_model(rets, vol="EGarch", p=1, q=1, dist="t")
         else:
             am = arch_model(rets, vol="Garch", p=1, q=1, dist="t")
-
         res = am.fit(disp="off", show_warning=False)
         fc  = res.forecast(horizon=1, reindex=False)
-        forecast_var = float(fc.variance.values[-1, 0])       # 單位: (%)²
-        forecast_vol = np.sqrt(forecast_var) / 100            # 轉回小數標準差
-
-        # 診斷：α、γ（槓桿項）、β
+        forecast_var = float(fc.variance.values[-1, 0])
+        forecast_vol = np.sqrt(forecast_var) / 100
         params = res.params
         info = {
-            "model":       model_type,
-            "omega":       round(float(params.get("omega", 0)), 6),
-            "alpha":       round(float(params.get("alpha[1]", 0)), 4),
-            "gamma":       round(float(params.get("gamma[1]", 0)), 4),   # GJR 槓桿項
-            "beta":        round(float(params.get("beta[1]",  0)), 4),
-            "persistence": round(
+            "model":            model_type,
+            "omega":            round(float(params.get("omega",    0)), 6),
+            "alpha":            round(float(params.get("alpha[1]", 0)), 4),
+            "gamma":            round(float(params.get("gamma[1]", 0)), 4),
+            "beta":             round(float(params.get("beta[1]",  0)), 4),
+            "persistence":      round(
                 float(params.get("alpha[1]", 0))
                 + float(params.get("beta[1]",  0))
-                + 0.5 * float(params.get("gamma[1]", 0)),
-                4
-            ),
+                + 0.5 * float(params.get("gamma[1]", 0)), 4),
             "forecast_vol_pct": round(forecast_vol * 100, 4),
         }
         return forecast_vol, info
-
     except Exception as e:
         return None, {"error": str(e)}
 
 
-# ─────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 # 公用工具
-# ─────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -132,15 +105,14 @@ def parse_args():
     p.add_argument("--momentum-boost",    type=float, default=None)
     p.add_argument("--path-spread",       type=float, default=1.0)
     p.add_argument("--output",            default="forward_study")
-    # --- auto-calibrate ---
     p.add_argument("--auto-calibrate",    action="store_true")
     p.add_argument("--calib-window",      type=int, default=500)
-    # --- GARCH 波動率模型 (v9) ---
     p.add_argument("--garch-model",       default="gjr",
-                   choices=["gjr", "garch", "egarch"],
-                   help="GARCH 模型類型 (預設 gjr=GJR-GARCH)")
-    p.add_argument("--no-garch",          action="store_true",
-                   help="停用 GARCH，退回靜態 rv/theta 比值")
+                   choices=["gjr", "garch", "egarch"])
+    p.add_argument("--no-garch",          action="store_true")
+    # 新增： K 棒實體縮放上限（防止大紅K）
+    p.add_argument("--body-scale-max",    type=float, default=1.5,
+                   help="實體大小上限 (%/day)，超過時自動縮放 vol （預設 1.5%）")
     return p.parse_args()
 
 
@@ -158,17 +130,9 @@ def recent_realized_vol(close_arr: np.ndarray, window: int) -> float:
 
 
 def auto_calibrate(
-    df: pd.DataFrame,
-    window: int,
-    theta_vol: float,
-    last_seg_drift: float,
-    use_garch: bool = True,
-    garch_model: str = "gjr",
-) -> dict:
-    """
-    v9 升級：vol_multiplier 優先使用 GJR-GARCH 1-step-ahead σ，
-    fallback 到 rv/theta 靜態比值。
-    """
+    df, window, theta_vol, last_seg_drift,
+    use_garch=True, garch_model="gjr",
+):
     d = df.tail(window).copy()
     o = d["Open"].values.astype(float)
     h = d["High"].values.astype(float)
@@ -176,9 +140,8 @@ def auto_calibrate(
     c = d["Close"].values.astype(float)
     v = d["Volume"].values.astype(float)
 
-    # 1. 實體大小 → intra_bar
-    body_pct = np.abs(c - o) / (o + 1e-8)
-    avg_body = float(np.mean(body_pct))
+    body_pct  = np.abs(c - o) / (o + 1e-8)
+    avg_body  = float(np.mean(body_pct))
     if avg_body > 0.015:
         intra_bar = 2
     elif avg_body > 0.008:
@@ -186,32 +149,27 @@ def auto_calibrate(
     else:
         intra_bar = 4
 
-    # 2. 影線比例 → shadow_noise + shadow_clamp
-    body_size = np.abs(c - o) + 1e-8
-    full_range = h - l
-    sr = full_range / body_size
-    median_sr = float(np.median(sr))
-    p90_sr    = float(np.percentile(sr, 90))
+    body_size    = np.abs(c - o) + 1e-8
+    full_range   = h - l
+    sr           = full_range / body_size
+    median_sr    = float(np.median(sr))
+    p90_sr       = float(np.percentile(sr, 90))
     shadow_noise = float(np.clip(median_sr * 0.08, 0.06, 0.30))
     shadow_clamp = float(np.clip(p90_sr * 0.8, 1.5, 5.0))
 
-    # 3. 成交量自相關 → momentum_boost
-    v_ret = pd.Series(v).pct_change().dropna()
+    v_ret        = pd.Series(v).pct_change().dropna()
     vol_autocorr = float(v_ret.autocorr(lag=1)) if len(v_ret) > 10 else 0.0
     vol_autocorr = max(vol_autocorr, 0.0)
     momentum_boost = float(np.clip(1.0 + vol_autocorr * 2.0, 1.0, 3.0))
 
-    # 4. 價格報酬自相關 → drift_decay
-    p_ret = pd.Series(c).pct_change().dropna()
+    p_ret        = pd.Series(c).pct_change().dropna()
     ret_autocorr = float(p_ret.autocorr(lag=1)) if len(p_ret) > 10 else 0.0
-    drift_decay = float(np.clip(0.07 - ret_autocorr * 0.06, 0.01, 0.15))
+    drift_decay  = float(np.clip(0.07 - ret_autocorr * 0.06, 0.01, 0.15))
 
-    # 5. 實現波動率（備用）
-    log_rets = np.diff(np.log(c))
-    rv = float(np.std(log_rets))
+    log_rets        = np.diff(np.log(c))
+    rv              = float(np.std(log_rets))
     rv_vol_multiplier = float(np.clip(rv / max(theta_vol, 1e-8), 0.5, 3.0))
 
-    # 5b. GJR-GARCH 預測波動率 → vol_multiplier  (v9 核心升級)
     garch_info = {}
     garch_vol  = None
     if use_garch:
@@ -224,7 +182,6 @@ def auto_calibrate(
         vol_multiplier = rv_vol_multiplier
         vol_source = "rv_fallback"
 
-    # 6. 相對斜率比 → drift_scale
     hist_drift_all = float(np.mean(log_rets))
     if abs(hist_drift_all) > 1e-6:
         relative_momentum = last_seg_drift / abs(hist_drift_all)
@@ -233,29 +190,28 @@ def auto_calibrate(
         drift_scale = 1.0
 
     return {
-        "intra_bar":       intra_bar,
-        "shadow_noise":    round(shadow_noise, 3),
-        "shadow_clamp":    round(shadow_clamp, 2),
-        "momentum_boost":  round(momentum_boost, 2),
-        "drift_decay":     round(drift_decay, 4),
-        "vol_multiplier":  round(vol_multiplier, 3),
-        "drift_scale":     round(drift_scale, 3),
-        # 診斷
-        "_avg_body_pct":      round(avg_body * 100, 4),
-        "_median_sr":         round(median_sr, 3),
-        "_p90_sr":            round(p90_sr, 3),
-        "_vol_autocorr":      round(vol_autocorr, 4),
-        "_ret_autocorr":      round(ret_autocorr, 4),
-        "_rv_pct":            round(rv * 100, 4),
-        "_hist_drift_all":    round(hist_drift_all * 100, 4),
-        "_last_seg_drift":    round(last_seg_drift * 100, 4),
-        "_garch_info":        garch_info,
-        "_vol_source":        vol_source,
-        "_rv_vol_multiplier": round(rv_vol_multiplier, 3),
+        "intra_bar":           intra_bar,
+        "shadow_noise":        round(shadow_noise, 3),
+        "shadow_clamp":        round(shadow_clamp, 2),
+        "momentum_boost":      round(momentum_boost, 2),
+        "drift_decay":         round(drift_decay, 4),
+        "vol_multiplier":      round(vol_multiplier, 3),
+        "drift_scale":         round(drift_scale, 3),
+        "_avg_body_pct":       round(avg_body * 100, 4),
+        "_median_sr":          round(median_sr, 3),
+        "_p90_sr":             round(p90_sr, 3),
+        "_vol_autocorr":       round(vol_autocorr, 4),
+        "_ret_autocorr":       round(ret_autocorr, 4),
+        "_rv_pct":             round(rv * 100, 4),
+        "_hist_drift_all":     round(hist_drift_all * 100, 4),
+        "_last_seg_drift":     round(last_seg_drift * 100, 4),
+        "_garch_info":         garch_info,
+        "_vol_source":         vol_source,
+        "_rv_vol_multiplier":  round(rv_vol_multiplier, 3),
     }
 
 
-def clamp_shadows(ohlcv_open, ohlcv_high, ohlcv_low, ohlcv_close, shadow_clamp: float):
+def clamp_shadows(ohlcv_open, ohlcv_high, ohlcv_low, ohlcv_close, shadow_clamp):
     if shadow_clamp <= 0:
         return ohlcv_high.copy(), ohlcv_low.copy()
     body_top   = np.maximum(ohlcv_open, ohlcv_close)
@@ -267,6 +223,33 @@ def clamp_shadows(ohlcv_open, ohlcv_high, ohlcv_low, ohlcv_close, shadow_clamp: 
     new_high   = np.maximum(new_high, body_top)
     new_low    = np.minimum(new_low,  body_bot)
     return new_high, new_low
+
+
+def scale_candle_bodies(
+    ohlcv_open, ohlcv_close, ohlcv_high, ohlcv_low,
+    start_price: float, target_body_pct: float = 1.0,
+):
+    """
+    當預測 K 棒實體平均超過 target_body_pct 時，
+    按比例縮小每根 K 棒的開收距離（中心點不動）。
+    高低跌吜同比例縮小。
+    """
+    body_sizes = np.abs(ohlcv_close - ohlcv_open)
+    avg_body_pct = float(np.mean(body_sizes / start_price * 100))
+    if avg_body_pct <= target_body_pct:
+        return ohlcv_open.copy(), ohlcv_close.copy(), ohlcv_high.copy(), ohlcv_low.copy()
+
+    scale = target_body_pct / avg_body_pct
+    mid   = (ohlcv_open + ohlcv_close) / 2.0
+    new_open  = mid + (ohlcv_open  - mid) * scale
+    new_close = mid + (ohlcv_close - mid) * scale
+
+    # High/Low 也同比縮到中心
+    new_high = mid + (ohlcv_high - mid) * scale
+    new_low  = mid + (ohlcv_low  - mid) * scale
+    new_high = np.maximum(new_high, np.maximum(new_open, new_close))
+    new_low  = np.minimum(new_low,  np.minimum(new_open, new_close))
+    return new_open, new_close, new_high, new_low
 
 
 def compute_metrics(actual, median, p25, p75, p10, p90, start_price):
@@ -299,7 +282,7 @@ def print_diagnostics(
     args, theta, close_hist, actual_close,
     rv, vol_scale, last_drift, last_vol, bb_result,
     result, clamped_high, clamped_low, start_price, metrics,
-    calib_info=None
+    calib_info=None, body_scale_applied=False,
 ):
     T = args.forecast
     actual_end   = float(actual_close[-1]) if len(actual_close) else None
@@ -324,15 +307,15 @@ def print_diagnostics(
     seg_drifts = [f"{d*100:+.3f}%" for d in bb_result.segment_drifts]
     seg_vols   = [f"{v*100:.3f}%"  for v in bb_result.segment_vols]
 
-    body_sizes    = np.abs(result.ohlcv_close - result.ohlcv_open)
-    upper_shadows = clamped_high - np.maximum(result.ohlcv_open, result.ohlcv_close)
-    lower_shadows = np.minimum(result.ohlcv_open, result.ohlcv_close) - clamped_low
-    shadow_total  = upper_shadows + lower_shadows
-    shadow_ratio  = shadow_total / (body_sizes + 1e-8)
+    body_sizes       = np.abs(result.ohlcv_close - result.ohlcv_open)
+    upper_shadows    = clamped_high - np.maximum(result.ohlcv_open, result.ohlcv_close)
+    lower_shadows    = np.minimum(result.ohlcv_open, result.ohlcv_close) - clamped_low
+    shadow_total     = upper_shadows + lower_shadows
+    shadow_ratio     = shadow_total / (body_sizes + 1e-8)
     avg_shadow_ratio = float(np.mean(shadow_ratio))
     p50_shadow_ratio = float(np.median(shadow_ratio))
     p90_shadow_ratio = float(np.percentile(shadow_ratio, 90))
-    avg_body_pct  = float(np.mean(body_sizes / start_price * 100))
+    avg_body_pct     = float(np.mean(body_sizes / start_price * 100))
     direction_consistency = float(np.mean(
         np.sign(result.ohlcv_close[1:] - result.ohlcv_close[:-1]) ==
         np.sign(result.median_path[1:] - result.median_path[:-1])
@@ -344,10 +327,9 @@ def print_diagnostics(
     print("  VERBOSE DIAGNOSTICS (v9 GJR-GARCH + auto-calibrate)")
     print("=" * 60)
 
-    # --- 自動校準區塊 ---
     if calib_info is not None:
-        gi = calib_info.get("_garch_info", {})
-        vs = calib_info.get("_vol_source", "?")
+        gi  = calib_info.get("_garch_info", {})
+        vs  = calib_info.get("_vol_source", "?")
         rv_vm = calib_info.get("_rv_vol_multiplier", "?")
         print(f"\n[自動校準結果 (window={args.calib_window})]")
         print(f"  avg_body_pct (hist)  : {calib_info['_avg_body_pct']:.3f}%  → intra_bar={args.intra_bar}")
@@ -355,21 +337,22 @@ def print_diagnostics(
         print(f"  p90_shadow_ratio     : {calib_info['_p90_sr']:.3f}  → shadow_clamp={args.shadow_clamp}")
         print(f"  vol_autocorr         : {calib_info['_vol_autocorr']:+.4f}  → momentum_boost={args.momentum_boost}")
         print(f"  ret_autocorr         : {calib_info['_ret_autocorr']:+.4f}  → drift_decay={args.drift_decay}")
-        # v9 升級：顯示 GARCH 詳情
         if vs == "garch" and gi and "error" not in gi:
             print(f"  [v9 GJR-GARCH-t 波動率預測]")
             print(f"    model          : {gi.get('model','?')}")
-            print(f"    α (ARCH)       : {gi.get('alpha','?')}")
-            print(f"    γ (槓桿GJR)    : {gi.get('gamma','?')}  ← 下跌時波動放大")
-            print(f"    β (GARCH)      : {gi.get('beta','?')}")
-            print(f"    persistence    : {gi.get('persistence','?')}  (α+β+0.5γ, <1=穩定)")
-            print(f"    forecast σ/day : {gi.get('forecast_vol_pct','?')}%  → vol_multiplier={args.vol_multiplier}")
+            print(f"    \u03b1 (ARCH)       : {gi.get('alpha','?')}")
+            print(f"    \u03b3 (槓桿 GJR)    : {gi.get('gamma','?')}  ← 下跌時波動放大")
+            print(f"    \u03b2 (GARCH)      : {gi.get('beta','?')}")
+            print(f"    persistence    : {gi.get('persistence','?')}  (α+β+0.5\u03b3, <1=穩定)")
+            print(f"    forecast \u03c3/day : {gi.get('forecast_vol_pct','?')}%  → vol_multiplier={args.vol_multiplier}")
             print(f"    rv/theta (靜態): {calib_info['_rv_pct']:.4f}%/{theta.vol*100:.4f}%  → {rv_vm} (備用)")
         else:
             err = gi.get("error", "unknown") if gi else "disabled"
             print(f"  realized_vol/theta   : {calib_info['_rv_pct']:.4f}%/{theta.vol*100:.4f}%  → vol_multiplier={args.vol_multiplier}")
             print(f"  vol_source           : rv_fallback  (garch 失敗: {err})")
         print(f"  last_seg / hist_all  : {calib_info['_last_seg_drift']:+.4f}% / {calib_info['_hist_drift_all']:+.4f}%  → drift_scale={args.drift_scale}")
+        if body_scale_applied:
+            print(f"  body_scale           : applied ✅ (實體縮至 ~{args.body_scale_max:.1f}%)")
 
     print(f"\n[資料概況]")
     print(f"  symbol        : {args.symbol}")
@@ -390,7 +373,7 @@ def print_diagnostics(
         )
         flag = " \u2705" if abs(center_bias) <= 3 else " \u274c"
         print(f"  center_bias        : {center_bias:+.2f}%  {direction}{flag}")
-    print(f"  band_width_p10_90  : {band_width:.2f}%  (判斷: >{T*0.5:.0f}%=寬, <{T*0.2:.0f}%=窄)")
+    print(f"  band_width_p10_90  : {band_width:.2f}%  (判斷: >{T*0.5:.0f}%=对, <{T*0.2:.0f}%=窄)")
 
     print(f"\n[K 棒形態診斷]")
     status_body = " \u2705" if 0.3 <= avg_body_pct <= 1.5 else (" \u26a0 太大" if avg_body_pct > 1.5 else " \u274c 太小")
@@ -441,6 +424,7 @@ def print_diagnostics(
     print(f"  momentum_boost : {args.momentum_boost}")
     print(f"  path_spread    : {args.path_spread}")
     print(f"  n_paths        : {args.n_paths}")
+    print(f"  body_scale_max : {args.body_scale_max}%")
 
     print(f"\n[表現指標]")
     for k, v in metrics.items():
@@ -539,16 +523,14 @@ def main():
         args.vol_scale_min, args.vol_scale_max,
     ))
 
-    # === AUTO CALIBRATE (v9) ===
-    calib_info = None
+    calib_info   = None
     calib_window = min(args.calib_window, len(df) - args.forecast)
-    calib_df = df.iloc[train_end_idx - calib_window: train_end_idx]
-
-    use_garch = args.auto_calibrate and not args.no_garch
+    calib_df     = df.iloc[train_end_idx - calib_window: train_end_idx]
+    use_garch    = args.auto_calibrate and not args.no_garch
 
     if args.auto_calibrate:
         model_label = "disabled" if args.no_garch else args.garch_model.upper()
-        print(f"\n[auto-calibrate v9] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
+        print(f"\n[auto-calibrate v9] 揃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             calib_df, window=calib_window,
             theta_vol=theta.vol, last_seg_drift=last_drift,
@@ -567,8 +549,8 @@ def main():
         print(f"  intra_bar={args.intra_bar}  shadow_noise={args.shadow_noise}  shadow_clamp={args.shadow_clamp}")
         print(f"  momentum_boost={args.momentum_boost}  drift_decay={args.drift_decay}")
         if vs == "garch" and gi and "error" not in gi:
-            print(f"  vol_multiplier={args.vol_multiplier}  [GJR-GARCH σ={gi.get('forecast_vol_pct','?')}%/day  "
-                  f"γ={gi.get('gamma','?')} β={gi.get('beta','?')} persistence={gi.get('persistence','?')}]")
+            print(f"  vol_multiplier={args.vol_multiplier}  [GJR-GARCH \u03c3={gi.get('forecast_vol_pct','?')}%/day  "
+                  f"\u03b3={gi.get('gamma','?')} \u03b2={gi.get('beta','?')} persistence={gi.get('persistence','?')}]")
         else:
             print(f"  vol_multiplier={args.vol_multiplier}  [rv/theta fallback]  drift_scale={args.drift_scale}")
     else:
@@ -619,6 +601,24 @@ def main():
         args.shadow_clamp
     )
 
+    # ── body_scale ：縮小過大實體（解決大紅K問題） ──
+    body_scale_applied = False
+    body_sizes_raw = np.abs(result.ohlcv_close - result.ohlcv_open)
+    avg_body_raw   = float(np.mean(body_sizes_raw / start_price * 100))
+    if avg_body_raw > args.body_scale_max:
+        scaled_open, scaled_close, clamped_high, clamped_low = scale_candle_bodies(
+            result.ohlcv_open, result.ohlcv_close,
+            clamped_high, clamped_low,
+            start_price=start_price,
+            target_body_pct=args.body_scale_max,
+        )
+        result = dataclasses.replace(
+            result,
+            ohlcv_open=scaled_open,
+            ohlcv_close=scaled_close,
+        )
+        body_scale_applied = True
+
     metrics = compute_metrics(
         actual=actual_close, median=result.median_path,
         p25=result.p25, p75=result.p75,
@@ -636,6 +636,7 @@ def main():
         clamped_high=clamped_high, clamped_low=clamped_low,
         start_price=start_price, metrics=metrics,
         calib_info=calib_info,
+        body_scale_applied=body_scale_applied,
     )
 
     out_prefix   = Path(args.output)
@@ -695,6 +696,7 @@ def main():
         fwd_volume=fwd_volume_norm,
         p25=result.p25, p75=result.p75,
         p10=result.p10, p90=result.p90,
+        median_path=result.median_path,          # ← 麮黃線！之前漏傳這個
         actual_open=actual_open   if len(actual_close) > 0 else None,
         actual_high=actual_high   if len(actual_close) > 0 else None,
         actual_low=actual_low     if len(actual_close) > 0 else None,
