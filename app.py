@@ -33,6 +33,31 @@ _ohlcv_cache: dict[str, tuple[float, pd.DataFrame]] = {}
 CACHE_TTL = 1800
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Medoid 路徑選取（與 rolling_forward.py 邏輯完全一致）
+# ─────────────────────────────────────────────────────────────────────────────
+def select_medoid_path(all_paths: np.ndarray) -> tuple[int, np.ndarray]:
+    """從 all_paths (n, T) 中選出距離其他所有路徑 Euclidean 距離總和最小的那條。"""
+    n = all_paths.shape[0]
+    if n == 1:
+        return 0, all_paths[0]
+    if n > 200:
+        idx_sample = np.random.choice(n, 200, replace=False)
+        subset = all_paths[idx_sample]
+        diff = subset[:, np.newaxis, :] - subset[np.newaxis, :, :]
+        dist_sums = np.sqrt(np.sum(diff ** 2, axis=-1)).sum(axis=1)
+        medoid_local = int(np.argmin(dist_sums))
+        medoid_idx = int(idx_sample[medoid_local])
+    else:
+        diff = all_paths[:, np.newaxis, :] - all_paths[np.newaxis, :, :]
+        dist_sums = np.sqrt(np.sum(diff ** 2, axis=-1)).sum(axis=1)
+        medoid_idx = int(np.argmin(dist_sums))
+    return medoid_idx, all_paths[medoid_idx]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 資料取得 / 參數估計
+# ─────────────────────────────────────────────────────────────────────────────
 def get_ohlcv(symbol: str, start: str, end: str) -> pd.DataFrame:
     key = f"{symbol}_{start}_{end}"
     now = time.time()
@@ -50,13 +75,10 @@ def get_ohlcv(symbol: str, start: str, end: str) -> pd.DataFrame:
 
 
 def get_market_params(df: pd.DataFrame):
-    """MarketParameterEstimator.fit() 回傳 MarketParams dataclass"""
-    estimator = MarketParameterEstimator()
-    return estimator.fit(df)
+    return MarketParameterEstimator().fit(df)
 
 
 def get_theta(market_params) -> CalibratedTheta:
-    """由 MarketParams 導出 CalibratedTheta"""
     p = market_params
     return CalibratedTheta(
         vol=float(p.realized_vol),
@@ -71,75 +93,84 @@ def get_theta(market_params) -> CalibratedTheta:
 
 
 def auto_calibrate_drift(df_window: pd.DataFrame) -> dict:
-    window = df_window.tail(500)
-    log_rets = np.diff(np.log(window["Close"].values))
-    vol = float(np.std(log_rets)) if len(log_rets) >= 20 else 0.015
+    log_rets = np.diff(np.log(df_window.tail(500)["Close"].values))
+    vol   = float(np.std(log_rets))  if len(log_rets) >= 20 else 0.015
     drift = float(np.mean(log_rets)) if len(log_rets) >= 20 else 0.0
-    drift_scale = float(np.clip(abs(drift) / max(vol, 1e-6) * 0.8 + 0.5, 0.3, 3.2))
-    vol_multiplier = float(np.clip(vol / 0.015, 0.5, 3.0))
     return {
-        "drift_scale": round(drift_scale, 3),
-        "drift_decay": 0.05,
-        "vol_multiplier": round(vol_multiplier, 3),
-        "intra_bar": round(float(np.clip(vol * 1.5, 0.005, 0.06)), 4),
+        "drift_scale":   round(float(np.clip(abs(drift) / max(vol, 1e-6) * 0.8 + 0.5, 0.3, 3.2)), 3),
+        "drift_decay":   0.05,
+        "vol_multiplier":round(float(np.clip(vol / 0.015, 0.5, 3.0)), 3),
+        "intra_bar":     round(float(np.clip(vol * 1.5, 0.005, 0.06)), 4),
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 模擬核心：一次跑 n_sim_paths 條，選 medoid，與 pipeline 一致
+# ─────────────────────────────────────────────────────────────────────────────
 def run_simulation(
     df_hist: pd.DataFrame,
-    n_paths: int,
     forecast_bars: int,
     auto_params: dict,
+    n_sim_paths: int = 500,
     seed: int | None = None,
-) -> list[list[dict]]:
+) -> list[dict]:
     """
-    回傳 n_paths 條模擬路徑的 OHLC list。
-    每條路徑獨立跟一個 seed，由一個母 seed 疾装。
+    跑 n_sim_paths 條路徑，用 medoid 選取最具代表性的單條路徑。
+    OHLCV 建構邏輯與 rolling_forward.py 一致：
+      - open / high / low  來自 SimulationResult 的 representative_path OHLCV
+      - close              替換為 medoid 收盤序列
+    回傳單條路徑的 list[dict{open,high,low,close}]。
     """
-    market_params = get_market_params(df_hist)
-    theta = get_theta(market_params)
-    # 用 build_params_from_theta 覆寫校準欄位
+    market_params     = get_market_params(df_hist)
+    theta             = get_theta(market_params)
     calibrated_params = build_params_from_theta(theta, market_params)
 
-    rng = np.random.default_rng(seed)
-    seeds = rng.integers(0, 2**31, size=n_paths).tolist()
+    sim = USStockFutureSimulator(
+        params=calibrated_params,
+        forecast_steps=forecast_bars,
+        n_paths=n_sim_paths,
+        seed=seed,
+        vol_scale=float(auto_params["vol_multiplier"]),
+        mr_coeff=theta.mr_coeff,
+        node_coeff=theta.node_coeff,
+        momentum_strength=theta.momentum_strength,
+        momentum_decay=theta.momentum_decay,
+        breakout_boost=theta.breakout_boost,
+        drift_scale=float(auto_params["drift_scale"]),
+        drift_decay_rate=float(auto_params["drift_decay"]),
+    )
+    result = sim.simulate()
 
-    paths = []
-    for s in seeds:
-        sim = USStockFutureSimulator(
-            params=calibrated_params,
-            forecast_steps=forecast_bars,
-            n_paths=1,                          # 每次單條，保持 seed 獨立
-            seed=int(s),
-            vol_scale=float(auto_params["vol_multiplier"]),
-            mr_coeff=theta.mr_coeff,
-            node_coeff=theta.node_coeff,
-            momentum_strength=theta.momentum_strength,
-            momentum_decay=theta.momentum_decay,
-            breakout_boost=theta.breakout_boost,
-            drift_scale=float(auto_params["drift_scale"]),
-            drift_decay_rate=float(auto_params["drift_decay"]),
-        )
-        result = sim.simulate()
-        # ohlcv_* 是 representative path 的 intra-bar OHLCV
-        T = len(result.ohlcv_close)
-        path = [
-            {
-                "open":  round(float(result.ohlcv_open[t]),  4),
-                "high":  round(float(result.ohlcv_high[t]),  4),
-                "low":   round(float(result.ohlcv_low[t]),   4),
-                "close": round(float(result.ohlcv_close[t]), 4),
-            }
-            for t in range(T)
-        ]
-        paths.append(path)
-    return paths
+    # Medoid：在所有 close 路徑中選最中心那條
+    all_closes = result.future_paths[:, :forecast_bars]   # (n_sim_paths, T)
+    _, medoid_close = select_medoid_path(all_closes)       # (T,)
+
+    # OHLCV 骨幹來自 representative_path（RMSE-to-median 最小）
+    T = forecast_bars
+    o = result.ohlcv_open[:T]
+    h = result.ohlcv_high[:T]
+    l = result.ohlcv_low[:T]
+    c = medoid_close[:T]  # close 替換為 medoid
+
+    # 保持 high >= max(open, close)、low <= min(open, close)
+    h = np.maximum(h, np.maximum(o, c))
+    l = np.minimum(l, np.minimum(o, c))
+
+    return [
+        {
+            "open":  round(float(o[t]), 4),
+            "high":  round(float(h[t]), 4),
+            "low":   round(float(l[t]), 4),
+            "close": round(float(c[t]), 4),
+        }
+        for t in range(T)
+    ]
 
 
 def df_to_ohlc_list(df: pd.DataFrame) -> list[dict]:
     records = []
     for _, row in df.iterrows():
-        d = row["Date"]
+        d  = row["Date"]
         ts = int(d.timestamp()) if hasattr(d, "timestamp") else int(pd.Timestamp(d).timestamp())
         records.append({
             "time":  ts,
@@ -151,15 +182,18 @@ def df_to_ohlc_list(df: pd.DataFrame) -> list[dict]:
     return records
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# API
+# ─────────────────────────────────────────────────────────────────────────────
 @app.route("/api/simulate", methods=["POST"])
 def api_simulate():
     try:
-        body = request.get_json(force=True)
-        symbol       = body.get("symbol", "AAPL").upper().strip()
-        end_date_str = body.get("end_date", "2025-01-01")
+        body         = request.get_json(force=True)
+        symbol       = body.get("symbol",       "AAPL").upper().strip()
+        end_date_str = body.get("end_date",      "2025-01-01")
         forecast_bars = int(body.get("forecast_bars", 30))
-        n_paths      = min(int(body.get("n_paths", 5)), 20)
-        hist_bars    = int(body.get("hist_bars", 120))
+        hist_bars    = int(body.get("hist_bars",  120))
+        n_sim_paths  = int(body.get("n_sim_paths", 500))  # 內部模擬路徑數，預設 500
         seed         = body.get("seed", None)
         if seed is not None:
             seed = int(seed)
@@ -173,20 +207,19 @@ def api_simulate():
             return jsonify({"error": f"資料不足：{symbol} {fetch_start}~{fetch_end}"}), 400
 
         df_hist   = df_all[df_all["Date"] <= end_dt].copy()
-        df_future = df_all[df_all["Date"] > end_dt].head(forecast_bars).copy()
+        df_future = df_all[df_all["Date"] >  end_dt].head(forecast_bars).copy()
 
         if len(df_hist) < 100:
-            return jsonify({"error": "end_date 之前的歷史資料不足 100 根（MarketParameterEstimator 需要）"}), 400
+            return jsonify({"error": "end_date 之前的歷史資料不足 100 根"}), 400
 
         auto_params = auto_calibrate_drift(df_hist)
 
-        # 多抽 3x 路徑，前端從中隨機換組
-        fetch_n = min(n_paths * 3, 20)
-        paths = run_simulation(
+        # 單次模擬，回傳唯一一條 medoid 路徑
+        medoid_path = run_simulation(
             df_hist=df_hist,
-            n_paths=fetch_n,
             forecast_bars=forecast_bars,
             auto_params=auto_params,
+            n_sim_paths=n_sim_paths,
             seed=seed,
         )
 
@@ -208,31 +241,28 @@ def api_simulate():
                 d += timedelta(days=1)
             future_dates.append(d)
 
-        future_dates = future_dates[:forecast_bars]
-        future_ts = [int(pd.Timestamp(d).timestamp()) for d in future_dates]
+        future_ts = [int(pd.Timestamp(d).timestamp()) for d in future_dates[:forecast_bars]]
+        sim_candles = [
+            {"time": future_ts[i], **bar}
+            for i, bar in enumerate(medoid_path)
+            if i < len(future_ts)
+        ]
 
-        sim_paths_ts = []
-        for path in paths:
-            sim_paths_ts.append([
-                {"time": future_ts[i], **bar}
-                for i, bar in enumerate(path)
-                if i < len(future_ts)
-            ])
-
-        # 參數展示用
+        # 展示用參數
         mp = get_market_params(df_hist)
         th = get_theta(mp)
 
         return jsonify({
-            "symbol":        symbol,
-            "end_date":      end_date_str,
-            "hist_candles":  df_to_ohlc_list(df_hist.tail(hist_bars)),
+            "symbol":         symbol,
+            "end_date":       end_date_str,
+            "hist_candles":   df_to_ohlc_list(df_hist.tail(hist_bars)),
             "actual_candles": df_to_ohlc_list(df_future),
-            "sim_paths":     sim_paths_ts,
-            "auto_params":   auto_params,
+            "sim_candles":    sim_candles,   # 唯一一條 medoid 路徑
+            "n_sim_paths":    n_sim_paths,
+            "auto_params":    auto_params,
             "theta": {
-                "vol":               round(th.vol, 5),
-                "mr_coeff":         round(th.mr_coeff, 5),
+                "vol":               round(th.vol,               5),
+                "mr_coeff":          round(th.mr_coeff,          5),
                 "momentum_strength": round(th.momentum_strength, 4),
             },
         })
@@ -242,6 +272,9 @@ def api_simulate():
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 前端 HTML
+# ─────────────────────────────────────────────────────────────────────────────
 HTML = r"""
 <!DOCTYPE html>
 <html lang="zh-Hant">
@@ -283,7 +316,7 @@ HTML = r"""
     background: var(--accent); color: #fff; font-size: 13px; font-weight: 600;
     cursor: pointer; transition: background 0.15s; white-space: nowrap;
   }
-  button:hover { background: #3d7d87; }
+  button:hover  { background: #3d7d87; }
   button:disabled { background: #2a4a4f; color: #71717a; cursor: not-allowed; }
   #resim-btn { background: #2a3a2a; color: #6daa45; border: 1px solid #3a5a3a; }
   #resim-btn:hover { background: #3a5a3a; }
@@ -295,21 +328,21 @@ HTML = r"""
   }
   #info-bar span { white-space: nowrap; }
   .tag { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
-  .tag-green  { background: #1a3a30; color: var(--green); }
+  .tag-teal   { background: #1a3035; color: var(--accent); }
   .tag-yellow { background: #3a3010; color: var(--actual); }
   .tag-muted  { background: #1e1e24; color: var(--muted); }
   #chart-wrap { flex: 1; position: relative; overflow: hidden; }
   #chart { width: 100%; height: 100%; }
   #legend {
     position: absolute; top: 12px; left: 16px;
-    background: rgba(15,15,17,0.85); border: 1px solid var(--border);
+    background: rgba(15,15,17,0.88); border: 1px solid var(--border);
     border-radius: var(--radius); padding: 8px 12px;
-    font-size: 12px; line-height: 1.8; pointer-events: none; z-index: 10;
+    font-size: 12px; line-height: 1.9; pointer-events: none; z-index: 10;
   }
   .legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
   #loading {
     display: none; position: absolute; inset: 0;
-    background: rgba(15,15,17,0.7);
+    background: rgba(15,15,17,0.72);
     align-items: center; justify-content: center;
     font-size: 14px; color: var(--accent);
     z-index: 100; flex-direction: column; gap: 12px;
@@ -331,8 +364,8 @@ HTML = r"""
   @media (max-width: 768px) {
     header { gap: 8px; padding: 8px 12px; }
     header h1 { display: none; }
-    input[type="text"]   { width: 70px; }
-    input[type="date"]   { width: 130px; }
+    input[type="text"] { width: 70px; }
+    input[type="date"] { width: 130px; }
   }
 </style>
 </head>
@@ -342,31 +375,25 @@ HTML = r"""
   <div class="ctrl-group"><label>股票</label><input type="text" id="symbol" value="AAPL" /></div>
   <div class="ctrl-group"><label>截止日</label><input type="date" id="end-date" value="2024-06-01" /></div>
   <div class="ctrl-group"><label>預測根數</label><input type="number" id="forecast-bars" value="30" min="5" max="120" /></div>
-  <div class="ctrl-group"><label>模擬路徑數</label><input type="number" id="n-paths" value="5" min="1" max="20" /></div>
   <div class="ctrl-group"><label>歷史顯示根數</label><input type="number" id="hist-bars" value="60" min="20" max="250" /></div>
+  <div class="ctrl-group"><label>模擬路徑數</label><input type="number" id="n-sim-paths" value="500" min="50" max="2000" /></div>
   <button id="run-btn" onclick="runSim()">執行</button>
-  <button id="resim-btn" onclick="resim()" disabled>重新抽樣</button>
+  <button id="resim-btn" onclick="runSim()" disabled>重新模擬</button>
 </header>
 <div id="info-bar"><span id="info-text">輸入參數後點擊「執行」</span></div>
 <div id="chart-wrap">
   <div id="chart"></div>
   <div id="legend">
     <div><span class="legend-dot" style="background:#6b7280"></span>歷史 K 棒</div>
-    <div><span class="legend-dot" style="background:rgba(79,152,163,0.6)"></span>模擬路徑（隨機抽樣）</div>
-    <div><span class="legend-dot" style="background:var(--actual)"></span>實際走勢</div>
+    <div><span class="legend-dot" style="background:#4f98a3"></span>模擬（Medoid 路徑）</div>
+    <div><span class="legend-dot" style="background:#f0c040"></span>實際走勢</div>
   </div>
-  <div id="loading"><div class="spinner"></div><span>模擬中...</span></div>
+  <div id="loading"><div class="spinner"></div><span id="loading-text">模擬中...</span></div>
 </div>
 <div id="toast"></div>
 <script>
-let chart = null, histSeries = null, simSeriesList = [], actualSeries = null;
-let lastData = null;
-const SIM_COLORS = [
-  'rgba(79,152,163,0.75)','rgba(109,170,69,0.70)','rgba(240,192,64,0.65)',
-  'rgba(210,99,167,0.65)','rgba(85,145,199,0.70)','rgba(187,101,59,0.70)',
-  'rgba(132,110,220,0.65)','rgba(79,200,140,0.65)','rgba(220,150,79,0.65)',
-  'rgba(160,79,163,0.65)',
-];
+let chart = null, histSeries = null, simSeries = null, actualSeries = null;
+
 function initChart() {
   if (chart) { chart.remove(); chart = null; }
   const el = document.getElementById('chart');
@@ -382,104 +409,112 @@ function initChart() {
     if (chart) chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
   });
 }
+
 function clearSeries() {
   if (!chart) return;
-  simSeriesList.forEach(s => chart.removeSeries(s));
-  if (histSeries)   chart.removeSeries(histSeries);
-  if (actualSeries) chart.removeSeries(actualSeries);
-  simSeriesList = []; histSeries = null; actualSeries = null;
+  if (histSeries)   { chart.removeSeries(histSeries);   histSeries   = null; }
+  if (simSeries)    { chart.removeSeries(simSeries);    simSeries    = null; }
+  if (actualSeries) { chart.removeSeries(actualSeries); actualSeries = null; }
 }
+
 function renderData(data) {
   clearSeries();
-  const allPaths = data.sim_paths;
-  const n = Math.min(parseInt(document.getElementById('n-paths').value)||5, allPaths.length);
-  const idx = shuffle(allPaths.length).slice(0, n);
-  const paths = idx.map(i => allPaths[i]);
 
+  // 歷史 K 棒（暗灰）
   histSeries = chart.addCandlestickSeries({
-    upColor:'#4b5563', downColor:'#374151',
-    borderUpColor:'#6b7280', borderDownColor:'#4b5563',
-    wickUpColor:'#6b7280', wickDownColor:'#4b5563',
+    upColor: '#4b5563', downColor: '#374151',
+    borderUpColor: '#6b7280', borderDownColor: '#4b5563',
+    wickUpColor:   '#6b7280', wickDownColor:   '#4b5563',
   });
   histSeries.setData(data.hist_candles);
 
-  paths.forEach((path, i) => {
-    const c = SIM_COLORS[i % SIM_COLORS.length];
-    const s = chart.addCandlestickSeries({
-      upColor:c, downColor:c, borderUpColor:c, borderDownColor:c, wickUpColor:c, wickDownColor:c,
-    });
-    s.setData(path);
-    simSeriesList.push(s);
+  // Medoid 模擬路徑（主色）
+  simSeries = chart.addCandlestickSeries({
+    upColor: '#4f98a3', downColor: '#2a5f68',
+    borderUpColor: '#4f98a3', borderDownColor: '#2a5f68',
+    wickUpColor:   '#4f98a3', wickDownColor:   '#2a5f68',
   });
+  simSeries.setData(data.sim_candles);
 
+  // 實際走勢（黃）
   if (data.actual_candles && data.actual_candles.length > 0) {
     actualSeries = chart.addCandlestickSeries({
-      upColor:'#f0c040', downColor:'#c07820',
-      borderUpColor:'#f0c040', borderDownColor:'#c07820',
-      wickUpColor:'#f0c040', wickDownColor:'#c07820',
+      upColor: '#f0c040', downColor: '#c07820',
+      borderUpColor: '#f0c040', borderDownColor: '#c07820',
+      wickUpColor:   '#f0c040', wickDownColor:   '#c07820',
     });
     actualSeries.setData(data.actual_candles);
   }
+
   chart.timeScale().fitContent();
 }
-function shuffle(n) {
-  const a = Array.from({length:n},(_,i)=>i);
-  for (let i=a.length-1;i>0;i--) { const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; }
-  return a;
-}
+
 async function runSim() {
-  const symbol = document.getElementById('symbol').value.trim().toUpperCase();
-  const endDate = document.getElementById('end-date').value;
+  const symbol       = document.getElementById('symbol').value.trim().toUpperCase();
+  const endDate      = document.getElementById('end-date').value;
   const forecastBars = parseInt(document.getElementById('forecast-bars').value);
-  const nPaths = parseInt(document.getElementById('n-paths').value);
-  const histBars = parseInt(document.getElementById('hist-bars').value);
+  const histBars     = parseInt(document.getElementById('hist-bars').value);
+  const nSimPaths    = parseInt(document.getElementById('n-sim-paths').value) || 500;
+
   if (!symbol || !endDate) { showToast('請填寫股票代碼和截止日'); return; }
-  setLoading(true);
-  document.getElementById('run-btn').disabled = true;
+
+  setLoading(true, `模擬中（${nSimPaths} 條路徑）...`);
+  document.getElementById('run-btn').disabled   = true;
   document.getElementById('resim-btn').disabled = true;
+
   try {
     const resp = await fetch('/api/simulate', {
       method: 'POST',
-      headers: {'Content-Type':'application/json'},
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        symbol, end_date: endDate,
+        symbol,
+        end_date:      endDate,
         forecast_bars: forecastBars,
-        n_paths: nPaths,
-        hist_bars: histBars,
-        seed: Math.floor(Math.random()*99999),
+        hist_bars:     histBars,
+        n_sim_paths:   nSimPaths,
+        seed:          Math.floor(Math.random() * 99999),
       }),
     });
     const data = await resp.json();
-    if (data.error) { showToast(data.error); if(data.trace) console.error(data.trace); return; }
-    lastData = data;
+    if (data.error) { showToast(data.error); if (data.trace) console.error(data.trace); return; }
+
     if (!chart) initChart();
     renderData(data);
+
     const ap = data.auto_params, th = data.theta;
     document.getElementById('info-text').innerHTML = [
       `<span class="tag tag-muted">${data.symbol}  截至 ${data.end_date}</span>`,
+      `<span>Medoid / <b>${data.n_sim_paths}</b> 條</span>`,
       `<span>drift_scale <b>${ap.drift_scale}</b></span>`,
       `<span>vol_mult <b>${ap.vol_multiplier}</b></span>`,
       `<span>theta.vol <b>${th.vol}</b></span>`,
       `<span>theta.mr <b>${th.mr_coeff}</b></span>`,
       `<span>theta.mom <b>${th.momentum_strength}</b></span>`,
       `<span class="tag tag-yellow">黃色=實際</span>`,
-      `<span class="tag tag-green">彩色=模擬 (${data.sim_paths.length}條取${nPaths})</span>`,
+      `<span class="tag tag-teal">藍綠=Medoid 模擬</span>`,
     ].join('');
+
     document.getElementById('resim-btn').disabled = false;
-  } catch(e) {
-    showToast('請求失敗：'+e.message);
+  } catch (e) {
+    showToast('請求失敗：' + e.message);
   } finally {
     setLoading(false);
     document.getElementById('run-btn').disabled = false;
   }
 }
-function resim() { if (lastData) renderData(lastData); }
-function setLoading(on) { document.getElementById('loading').classList.toggle('show', on); }
+
+function setLoading(on, msg) {
+  document.getElementById('loading').classList.toggle('show', on);
+  if (msg) document.getElementById('loading-text').textContent = msg;
+}
+
 function showToast(msg) {
   const el = document.getElementById('toast');
-  el.textContent = msg; el.classList.add('show');
-  setTimeout(()=>el.classList.remove('show'), 4000);
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 4500);
 }
+
 initChart();
 </script>
 </body>
