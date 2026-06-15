@@ -1,13 +1,16 @@
 """
-forward_study.py  v11.1  (GJR-GARCH + auto-calibrate + OHLC K線預測)
+forward_study.py  v11.2  (GJR-GARCH + auto-calibrate + OHLC K線預測)
 
-v11.1 新增：
-  1. print_ohlc_comparison() — 每根 K 棒對照表，印出預測 OHLC vs 實際 OHLC
-     方便直接比對哪段有偶差、哪段方向對、哪段波動率偏差
-  2. 修正實際收盤線消失問題：將 future_df 的實際 OHLC 一並傳入 render_forecast
+v11.2 新增：
+  1. blend_drift 動態截斷 — MAX = 0.5 × σ_garch（無 GARCH 時 fallback 到 0.5 × rv）
+     防止 short_drift(5d) 在短暫回調時把 drift 拉爆
+
+v11.1 已有：
+  1. print_ohlc_comparison() — 每根 K 棒對照表
+  2. 修正實際收盤線消失問題
 
 v11 已有：
-  1. 保留 momentum_bias + node_breakout_state
+  1. momentum_bias + node_breakout_state
   2. backbone drift = 0.4 × short_drift(5d) + 0.6 × last_drift
 
 v10 已有：
@@ -95,10 +98,6 @@ def ensure_ohlcv(df):
 
 
 def pick_representative_path(result, paths_fallback: np.ndarray | None = None):
-    """
-    優先從 SimulationResult.representative_path + ohlcv_* 取出代表路徑與 OHLC。
-    若 representative_path 是空 array，才 fallback 到舊邏輯。
-    """
     rep = getattr(result, "representative_path", None)
     if rep is not None and len(rep) > 0:
         o = getattr(result, "ohlcv_open",  None)
@@ -156,6 +155,8 @@ def parse_args():
     p.add_argument("--verbose",         action="store_true")
     p.add_argument("--short-drift-weight", type=float, default=0.4,
                    help="近期 5 日 drift 在 backbone 混合中的權重 (0~1)")
+    p.add_argument("--drift-clamp",    type=float, default=None,
+                   help="手動指定 blend_drift 截斷上限 (絕對值, 每日)。不指定則動態用 0.5×σ_garch")
     return p.parse_args()
 
 
@@ -193,17 +194,22 @@ def auto_calibrate(
     drift_decay    = float(np.clip(0.02 + rv * 1.5, 0.03, 0.15))
     drift_scale    = float(np.clip(rv / max(theta.vol, 1e-8), 0.4, 3.0))
 
+    # 動態 drift 截斷上限：0.5 × σ (每日)
+    drift_clamp_max = float(base_vol * 0.5)
+
     return {
-        "intra_bar":      intra_bar,
-        "shadow_noise":   round(shadow_noise, 3),
-        "shadow_clamp":   round(shadow_clamp, 2),
-        "momentum_boost": momentum_boost,
-        "drift_decay":    round(drift_decay, 4),
-        "vol_multiplier": round(vol_multiplier, 4),
-        "drift_scale":    round(drift_scale, 4),
-        "_vol_source":    vol_source,
-        "_avg_body_pct":  round(avg_body * 100, 3),
-        "_garch_info":    garch_info,
+        "intra_bar":        intra_bar,
+        "shadow_noise":     round(shadow_noise, 3),
+        "shadow_clamp":     round(shadow_clamp, 2),
+        "momentum_boost":   momentum_boost,
+        "drift_decay":      round(drift_decay, 4),
+        "vol_multiplier":   round(vol_multiplier, 4),
+        "drift_scale":      round(drift_scale, 4),
+        "drift_clamp_max":  round(drift_clamp_max, 5),
+        "_vol_source":      vol_source,
+        "_avg_body_pct":    round(avg_body * 100, 3),
+        "_garch_info":      garch_info,
+        "_base_vol":        round(float(base_vol), 6),
     }
 
 
@@ -213,9 +219,9 @@ def auto_calibrate(
 def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dict | None,
                       momentum_bias: float = 0.0, breakout_state: int = 0,
                       blend_drift: float = 0.0, short_drift: float = 0.0,
-                      last_drift: float = 0.0):
+                      last_drift: float = 0.0, drift_clamp_max: float | None = None):
     print("\n" + "─" * 60)
-    print("  VERBOSE DIAGNOSTICS (v11.1)")
+    print("  VERBOSE DIAGNOSTICS (v11.2)")
     print("─" * 60)
     if calib_info:
         gi  = calib_info.get("_garch_info", {})
@@ -235,8 +241,14 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
     print(f"\n  [backbone drift 混合]")
     print(f"  short_drift(5d) : {short_drift*100:+.4f}%/day")
     print(f"  last_drift(bb)  : {last_drift*100:+.4f}%/day")
+    raw_blend = args.short_drift_weight * short_drift + (1 - args.short_drift_weight) * last_drift
+    clamp_str = f"  → 截斷至 {blend_drift*100:+.4f}%/day  (MAX=±{drift_clamp_max*100:.4f}%)" \
+        if drift_clamp_max and abs(raw_blend) > drift_clamp_max else ""
     print(f"  blend_drift     : {blend_drift*100:+.4f}%/day  "
-          f"(w={args.short_drift_weight:.1f}×short + {1-args.short_drift_weight:.1f}×long)")
+          f"(w={args.short_drift_weight:.1f}×short + {1-args.short_drift_weight:.1f}×long)"
+          + clamp_str)
+    if drift_clamp_max:
+        print(f"  drift_clamp_max : ±{drift_clamp_max*100:.4f}%/day  (0.5×σ_garch)")
     print(f"\n  [最終模擬參數]")
     print(f"  intra_bar       : {args.intra_bar}")
     print(f"  momentum_boost  : {args.momentum_boost}")
@@ -251,7 +263,7 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# print_ohlc_comparison  — 預測 vs 實際 OHLC 每棒對照表
+# print_ohlc_comparison
 # ──────────────────────────────────────────────────────────────────────────────
 def print_ohlc_comparison(
     pred_ohlc: dict | None,
@@ -260,10 +272,6 @@ def print_ohlc_comparison(
     start_price: float,
     symbol: str,
 ):
-    """
-    逐根印出預測 OHLC vs 實際 OHLC。
-    actual_df 應包含 Open / High / Low / Close 欄位。
-    """
     n = len(pred_close)
     has_actual = actual_df is not None and len(actual_df) >= 1
     has_pred_ohlc = pred_ohlc is not None
@@ -306,7 +314,6 @@ def print_ohlc_comparison(
             cls_err = (p_c - a_c) / a_c * 100
             close_errs.append(abs(cls_err))
 
-            # 方向對还是反？
             p_dir = "+" if p_c >= prev_pred_c else "-"
             a_dir = "+" if a_c >= prev_act_c  else "-"
             dir_match = "✓" if p_dir == a_dir else "✗"
@@ -406,7 +413,6 @@ def render_forecast(
     bull_patch = mpatches.Patch(color="#26A69A", label="預測漲K")
     bear_patch = mpatches.Patch(color="#EF5350", label="預測跌K")
 
-    # 實際走勢 — 優先用實際 OHLC 的 close，其次用 actual_close
     _actual_c = None
     if actual_ohlc is not None and "close" in actual_ohlc:
         _actual_c = np.asarray(actual_ohlc["close"])
@@ -578,7 +584,7 @@ def main():
         auto_adjust=False, progress=False,
     )
     df = ensure_ohlcv(df_raw)
-    print(f"下載完成：{len(df)} 根 K 棒")
+    print(f"下載完成：{len(df)} 根 K 棒  (訓練截止={end_dt.date()}，預抓至={dl_end.date()})")
 
     if "Date" in df.columns:
         dates = pd.to_datetime(df["Date"])
@@ -598,7 +604,6 @@ def main():
     close_hist   = train_df["Close"].values.astype(float)
     actual_close = future_df["Close"].values.astype(float) if len(future_df) > 0 else None
 
-    # 實際 OHLC dict — 用於對照表和圖表
     actual_ohlc: dict | None = None
     if len(future_df) > 0:
         actual_ohlc = {
@@ -608,7 +613,7 @@ def main():
             "close": future_df["Close"].values.astype(float),
         }
 
-    start_price  = float(close_hist[-1])
+    start_price = float(close_hist[-1])
 
     # ── auto-calibrate ──
     calib_info             = None
@@ -618,7 +623,7 @@ def main():
     if args.auto_calibrate:
         calib_window = args.calib_window
         model_label  = args.garch_model if use_garch else "rv"
-        print(f"\n[auto-calibrate v11.1] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
+        print(f"\n[auto-calibrate v11.2] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             df.iloc[:train_end_idx]["Close"].values.astype(float),
             theta,
@@ -634,6 +639,9 @@ def main():
         if args.drift_decay    is None: args.drift_decay    = calib["drift_decay"]
         if args.vol_multiplier is None: args.vol_multiplier = calib["vol_multiplier"]
         if args.drift_scale    is None: args.drift_scale    = calib["drift_scale"]
+        # drift clamp：手動 > 動態計算
+        if args.drift_clamp is None:
+            args.drift_clamp = calib["drift_clamp_max"]
     else:
         if args.intra_bar      is None: args.intra_bar      = 2
         if args.shadow_noise   is None: args.shadow_noise   = 0.15
@@ -673,6 +681,15 @@ def main():
     w            = float(np.clip(args.short_drift_weight, 0.0, 1.0))
     blend_drift  = w * short_drift + (1.0 - w) * last_drift
 
+    # ── v11.2：動態截斷 blend_drift ──
+    drift_clamp_max = args.drift_clamp  # 已在 auto_calibrate 或手動設定
+    if drift_clamp_max is not None and drift_clamp_max > 0:
+        blend_drift_raw = blend_drift
+        blend_drift = float(np.clip(blend_drift, -drift_clamp_max, drift_clamp_max))
+        if abs(blend_drift_raw - blend_drift) > 1e-8:
+            print(f"  [drift clamp] {blend_drift_raw*100:+.4f}%/day → {blend_drift*100:+.4f}%/day  "
+                  f"(MAX=±{drift_clamp_max*100:.4f}%/day)")
+
     drift_fwd = np.full(args.forecast, blend_drift)
     vol_fwd   = np.full(args.forecast, last_vol) * (args.vol_multiplier or 1.0)
     bb_fwd    = start_price * np.cumprod(1 + drift_fwd)
@@ -704,6 +721,7 @@ def main():
             blend_drift=blend_drift,
             short_drift=short_drift,
             last_drift=last_drift,
+            drift_clamp_max=drift_clamp_max,
         )
 
     # ── simulate ──
@@ -737,7 +755,6 @@ def main():
     )
     result = sim.simulate()
 
-    # ── 代表路徑 + OHLC ──
     rep_close, ohlc = pick_representative_path(result)
 
     if len(rep_close) == 0:
@@ -748,7 +765,6 @@ def main():
     if ohlc is not None:
         ohlc = {k: v[:args.forecast] for k, v in ohlc.items()}
 
-    # ── summary ──
     n          = len(rep_close)
     final_pred = float(rep_close[n - 1])
     total_ret  = (final_pred - start_price) / start_price * 100
@@ -762,7 +778,6 @@ def main():
         print(f"  實際終點 : {actual_close[na-1]:.2f}  ({actual_ret:+.1f}%)")
         print(f"  MAE      : {mae:.2f}%")
 
-    # ── OHLC 對照表（每根 K 棒明細）──
     print_ohlc_comparison(
         pred_ohlc=ohlc,
         pred_close=rep_close,
@@ -771,7 +786,6 @@ def main():
         symbol=args.symbol,
     )
 
-    # ── 儲存 JSON ──
     model_tag = "+model" if _pm_pipelines is not None else ""
     mode_tag  = (f"v11-{args.garch_model}(w={args.calib_window}){model_tag}"
                  if args.auto_calibrate else "manual")
@@ -793,6 +807,7 @@ def main():
             "drift_scale":        args.drift_scale,
             "blend_drift":        round(blend_drift, 6),
             "short_drift_weight": w,
+            "drift_clamp_max":    round(drift_clamp_max, 6) if drift_clamp_max else None,
         },
         "momentum_bias":    momentum_bias,
         "breakout_state":   breakout_state,
