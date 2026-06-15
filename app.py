@@ -8,8 +8,12 @@ app.py  —  Flask K-bar simulation viewer
 
 模擬優先順序：
   1. 若 cache/{SYM}_theta.json 存在 → 直接用 pipeline 校準好的 theta
-     若同時有 cache/{SYM}_agent_profile.json → 套用 agent 行為調整
+     若同時有 results/fear/{SYM}_fear_profile.json → 套用 fear profile 調整
+     若同時有 models/param_model_{SYM}.joblib → surrogate 取代 grid search
   2. 否則 fallback：MarketParameterEstimator 即時估算（原有邏輯不動）
+
+  /api/simulate 現在直接呼叫 scripts/rolling_forward.rolling_forward()，
+  與 run_pipeline.py 完全共用同一套「分段推進＋真實資料校準」機制。
 """
 
 from __future__ import annotations
@@ -27,27 +31,30 @@ import yfinance as yf
 from flask import Flask, jsonify, render_template_string, request
 
 warnings.filterwarnings("ignore")
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+ROOT      = Path(__file__).parent
+CACHE_DIR = ROOT / "cache"
+
+# ── 注入 src/ 和 scripts/ ────────────────────────────────────────────────────
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from backbone_fitter import BackboneFitter
 from calibrated_simulator import CalibratedTheta, build_params_from_theta
 from market_estimator import MarketParameterEstimator
 from us_equity_simulator import USStockFutureSimulator
+from rolling_forward import rolling_forward, _load_vix_series
 
 app = Flask(__name__)
-
-ROOT       = Path(__file__).parent
-CACHE_DIR  = ROOT / "cache"
 
 _ohlcv_cache: dict[str, tuple[float, pd.DataFrame]] = {}
 CACHE_TTL = 1800
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Medoid 路徑選取（原有，不動）
+# Medoid 路徑選取（保留，run_simulation fallback 仍用）
 # ─────────────────────────────────────────────────────────────────────────────
 def select_medoid_path(all_paths: np.ndarray) -> tuple[int, np.ndarray]:
-    """all_paths (n, T) → 距離其他路徑 Euclidean 距離總和最小那條。"""
     n = all_paths.shape[0]
     if n == 1:
         return 0, all_paths[0]
@@ -62,7 +69,7 @@ def select_medoid_path(all_paths: np.ndarray) -> tuple[int, np.ndarray]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 資料取得（原有，不動）
+# 資料取得
 # ─────────────────────────────────────────────────────────────────────────────
 def get_ohlcv(symbol: str, start: str, end: str) -> pd.DataFrame:
     key = f"{symbol}_{start}_{end}"
@@ -81,13 +88,9 @@ def get_ohlcv(symbol: str, start: str, end: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pipeline cache 讀取（新增）
+# Pipeline cache 讀取
 # ─────────────────────────────────────────────────────────────────────────────
 def load_pipeline_theta(symbol: str) -> CalibratedTheta | None:
-    """
-    嘗試讀取 pipeline 校準好的 theta。
-    回傳 CalibratedTheta 或 None（cache 不存在時）。
-    """
     path = CACHE_DIR / f"{symbol}_theta.json"
     if not path.exists():
         return None
@@ -104,24 +107,75 @@ def load_pipeline_theta(symbol: str) -> CalibratedTheta | None:
 
 def load_pipeline_agent_profile(symbol: str) -> dict | None:
     """
-    嘗試讀取 pipeline 校準好的 agent_profile。
-    回傳 dict 或 None。
+    讀取 Step 3 產出的 fear_profile（results/fear/{SYM}_fear_profile.json），
+    並將其欄位對應至 rolling_forward.apply_agent_profile 所需的 schema：
+      retail_momentum_strength  ← 1.0 - fear_drift_decay_rate（恐慌越強動能越弱）
+      retail_panic_sensitivity  ← fear_vol_mult 正規化到 [0.1, 0.9]
+      inst_mr_strength          ← 固定 0.5（fear_profile 無此資訊）
+      vix_level                 ← 20.0（無 VIX 時使用基準值）
     """
-    path = CACHE_DIR / f"{symbol}_agent_profile.json"
+    # Step 3 寫到 results/fear/；cache/ 下若有舊版也嘗試讀取
+    candidates = [
+        ROOT / "results" / "fear" / f"{symbol}_fear_profile.json",
+        CACHE_DIR / f"{symbol}_fear_profile.json",   # 相容舊路徑
+    ]
+    path = None
+    for c in candidates:
+        if c.exists():
+            path = c
+            break
+    if path is None:
+        return None
+
+    try:
+        with open(path) as f:
+            fp = json.load(f)
+
+        # 欄位映射
+        fear_drift_decay = float(fp.get("fear_drift_decay_rate", 0.3))
+        fear_vol_mult    = float(fp.get("fear_vol_mult", 1.3))
+
+        profile = {
+            # 動能強度：恐慌衰減越高 → 動能越低
+            "retail_momentum_strength": round(float(np.clip(1.0 - fear_drift_decay, 0.1, 0.9)), 3),
+            # 恐慌靈敏度：vol_mult 正規化（1.0 = 無放大 → 0.0）
+            "retail_panic_sensitivity": round(float(np.clip((fear_vol_mult - 1.0) / 2.0, 0.1, 0.9)), 3),
+            # 機構 MR 強度：fear_profile 無此資訊，保持中性
+            "inst_mr_strength": 0.5,
+            "vix_level": 20.0,
+            # 保留原始 fear 欄位備查
+            "_fear_threshold":        fp.get("fear_threshold"),
+            "_fear_vol_mult":         fear_vol_mult,
+            "_fear_drift_decay_rate": fear_drift_decay,
+            "_source":                str(path),
+        }
+        print(f"[app] fear_profile 載入 ← {path}")
+        print(f"  retail_momentum={profile['retail_momentum_strength']}  "
+              f"panic_sens={profile['retail_panic_sensitivity']}  "
+              f"inst_mr={profile['inst_mr_strength']}")
+        return profile
+    except Exception as e:
+        print(f"[app] fear_profile 讀取失敗（{e}），跳過")
+        return None
+
+
+def load_pipeline_param_model(symbol: str):
+    """讀取 Step 5 訓練好的 GBM 代理模型。"""
+    path = ROOT / "models" / f"param_model_{symbol}.joblib"
     if not path.exists():
         return None
     try:
-        with open(path) as f:
-            profile = json.load(f)
-        print(f"[app] agent_profile 載入 ← {path}")
-        return profile
+        import joblib
+        payload = joblib.load(path)
+        print(f"[app] param_model 載入 ← {path}")
+        return payload
     except Exception as e:
-        print(f"[app] agent_profile 讀取失敗（{e}），跳過")
+        print(f"[app] param_model 讀取失敗（{e}），跳過")
         return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# agent_profile 套用（與 rolling_forward.py apply_agent_profile 邏輯一致）
+# apply_agent_profile（與 rolling_forward.py 邏輯一致，保留供 fallback 路徑用）
 # ─────────────────────────────────────────────────────────────────────────────
 def apply_agent_profile(
     profile: dict,
@@ -146,14 +200,13 @@ def apply_agent_profile(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Theta 取得：優先 pipeline cache，否則 fallback 到即時估算（原有邏輯保留）
+# 原有即時估算工具（保留供 fallback）
 # ─────────────────────────────────────────────────────────────────────────────
 def get_market_params(df: pd.DataFrame):
     return MarketParameterEstimator().fit(df)
 
 
 def get_theta_live(market_params) -> CalibratedTheta:
-    """原有即時估算路徑，不動。"""
     p = market_params
     return CalibratedTheta(
         vol=float(p.realized_vol),
@@ -168,7 +221,6 @@ def get_theta_live(market_params) -> CalibratedTheta:
 
 
 def auto_calibrate_drift(df_window: pd.DataFrame) -> dict:
-    """原有即時估算路徑，不動。"""
     log_rets = np.diff(np.log(df_window.tail(500)["Close"].values))
     vol   = float(np.std(log_rets))  if len(log_rets) >= 20 else 0.015
     drift = float(np.mean(log_rets)) if len(log_rets) >= 20 else 0.0
@@ -180,157 +232,32 @@ def auto_calibrate_drift(df_window: pd.DataFrame) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 骨幹建構（與 rolling_forward._run_one_step 對齊）
-# ─────────────────────────────────────────────────────────────────────────────
 def build_backbone_fwd(
     close_hist: np.ndarray,
     forecast_bars: int,
     short_drift_weight: float = 0.4,
 ) -> tuple[np.ndarray, float]:
-    """
-    對齊 rolling_forward._run_one_step 的骨幹邏輯：
-
-    1. BackboneFitter 擬合歷史，取最後一段 drift（long-term signal）
-    2. 近 5 根 log_ret 均值作為 short_drift（近期動量）
-    3. blend = short_drift_weight * short_drift + (1 - short_drift_weight) * last_drift
-    4. drift decay：每根乘以 decay_factor（向 0 收斂，模擬遠期不確定性增加）
-    5. bb_fwd = cumprod(1 + decayed_blend_drift_per_bar) * last_price
-
-    回傳 (bb_fwd array[forecast_bars], blend_drift scalar)
-    """
     fitter    = BackboneFitter(n_seg=6, smooth_reg=0.5)
     window    = close_hist[-500:] if len(close_hist) > 500 else close_hist
     bb_result = fitter.fit(window)
     last_drift = float(bb_result.segment_drifts[-1])
 
-    # 近 5 根動量
-    log_rets   = np.diff(np.log(window.astype(float)))
+    log_rets    = np.diff(np.log(window.astype(float)))
     short_drift = float(np.mean(log_rets[-5:])) if len(log_rets) >= 5 else last_drift
-
     blend_drift = short_drift_weight * short_drift + (1.0 - short_drift_weight) * last_drift
 
-    # decay：每根 drift 乘以 decay_factor^t，讓遠期骨幹平坦化
     decay_factor = 0.98
     t            = np.arange(1, forecast_bars + 1, dtype=float)
     decayed      = blend_drift * (decay_factor ** t)
 
     last_price = float(close_hist[-1])
     bb_fwd     = last_price * np.cumprod(1.0 + decayed)
-
     return bb_fwd, blend_drift
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 模擬核心
+# df_to_ohlc_list
 # ─────────────────────────────────────────────────────────────────────────────
-def run_simulation(
-    df_hist: pd.DataFrame,
-    symbol: str,
-    forecast_bars: int,
-    n_sim_paths: int = 500,
-    seed: int | None = None,
-) -> tuple[list[dict], dict, bool]:
-    """
-    優先讀 pipeline cache（theta + agent_profile）；
-    cache 不存在時 fallback 到即時估算。
-
-    回傳 (ohlcv_list, meta_dict, used_cache: bool)
-    """
-    # ── 嘗試讀 pipeline cache ────────────────────────────────────────────────
-    theta         = load_pipeline_theta(symbol)
-    agent_profile = load_pipeline_agent_profile(symbol)
-    used_cache    = theta is not None
-
-    if not used_cache:
-        # fallback：原有即時估算
-        market_params = get_market_params(df_hist)
-        theta         = get_theta_live(market_params)
-        auto_params   = auto_calibrate_drift(df_hist)
-        print("[app] fallback → live MarketParameterEstimator")
-    else:
-        auto_params = auto_calibrate_drift(df_hist)   # vol_multiplier / intra_bar 還是用近期資料
-
-    # ── 取 market_params 供 build_params_from_theta（需要 last_close 等欄位）
-    #    不論哪條路徑都跑一次 estimator，但 theta 已固定，估算結果只用作 params 骨架
-    market_params_for_params = get_market_params(df_hist)
-    calibrated_params = build_params_from_theta(theta, market_params_for_params)
-
-    # ── 骨幹建構（已對齊 rolling_forward._run_one_step）────────────────────
-    #    blend_drift = short_drift * 0.4 + backbone_last_drift * 0.6
-    #    + decay factor 0.98^t 讓遠期骨幹平坦化
-    close_hist = df_hist["Close"].values.astype(float)
-    bb_fwd, blend_drift = build_backbone_fwd(close_hist, forecast_bars)
-
-    print(
-        f"[app] bb_fwd  blend_drift={blend_drift:.5f}  "
-        f"start={bb_fwd[0]:.2f}  end={bb_fwd[-1]:.2f}"
-    )
-
-    # ── agent_profile 套用 ───────────────────────────────────────────────────
-    base_momentum_boost = 1.0
-    mr_coeff = theta.mr_coeff
-    if agent_profile is not None:
-        base_momentum_boost, mr_coeff = apply_agent_profile(
-            agent_profile,
-            base_momentum_boost,
-            mr_coeff,
-        )
-
-    sim = USStockFutureSimulator(
-        params=calibrated_params,
-        forecast_steps=forecast_bars,
-        n_paths=n_sim_paths,
-        seed=seed,
-        vol_scale=float(auto_params["vol_multiplier"]),
-        mr_coeff=mr_coeff,
-        node_coeff=theta.node_coeff,
-        momentum_strength=theta.momentum_strength * base_momentum_boost,
-        momentum_decay=theta.momentum_decay,
-        breakout_boost=theta.breakout_boost,
-        drift_scale=float(auto_params["drift_scale"]),
-        drift_decay_rate=float(auto_params["drift_decay"]),
-        backbone_schedule=bb_fwd,
-        backbone_mr_coeff=0.06,
-    )
-    result = sim.simulate()
-
-    all_closes = result.future_paths[:, :forecast_bars]
-    _, medoid_close = select_medoid_path(all_closes)
-
-    T = forecast_bars
-    o = result.ohlcv_open[:T]
-    h = result.ohlcv_high[:T]
-    l = result.ohlcv_low[:T]
-    c = medoid_close[:T]
-
-    h = np.maximum(h, np.maximum(o, c))
-    l = np.minimum(l, np.minimum(o, c))
-
-    ohlcv = [
-        {
-            "open":  round(float(o[t]), 4),
-            "high":  round(float(h[t]), 4),
-            "low":   round(float(l[t]), 4),
-            "close": round(float(c[t]), 4),
-        }
-        for t in range(T)
-    ]
-
-    meta = {
-        "auto_params":    auto_params,
-        "theta": {
-            "vol":               round(theta.vol,               5),
-            "mr_coeff":          round(mr_coeff,                5),
-            "momentum_strength": round(theta.momentum_strength, 4),
-        },
-        "bb_fwd":       bb_fwd,
-        "blend_drift":  round(blend_drift, 6),
-        "agent_active": agent_profile is not None,
-    }
-    return ohlcv, meta, used_cache
-
-
 def df_to_ohlc_list(df: pd.DataFrame) -> list[dict]:
     out = []
     for _, row in df.iterrows():
@@ -347,20 +274,20 @@ def df_to_ohlc_list(df: pd.DataFrame) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API
+# API  —  /api/simulate
+#   使用 rolling_forward() 取代單次連續模擬，與 run_pipeline.py 完全共用引擎。
+#   需要先跑過 run_pipeline.py 產生 cache/{SYM}_theta.json，否則回傳 400。
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/api/simulate", methods=["POST"])
 def api_simulate():
     try:
         body          = request.get_json(force=True)
-        symbol        = body.get("symbol",       "AAPL").upper().strip()
-        end_date_str  = body.get("end_date",      "2025-01-01")
+        symbol        = body.get("symbol",        "AAPL").upper().strip()
+        end_date_str  = body.get("end_date",       "2025-01-01")
         forecast_bars = int(body.get("forecast_bars", 30))
         hist_bars     = int(body.get("hist_bars",  120))
         n_sim_paths   = int(body.get("n_sim_paths", 500))
-        seed          = body.get("seed", None)
-        if seed is not None:
-            seed = int(seed)
+        step          = int(body.get("step", 5))
 
         end_dt      = datetime.strptime(end_date_str, "%Y-%m-%d")
         fetch_start = (end_dt - timedelta(days=900)).strftime("%Y-%m-%d")
@@ -370,67 +297,128 @@ def api_simulate():
         if df_all.empty or len(df_all) < 60:
             return jsonify({"error": f"資料不足：{symbol} {fetch_start}~{fetch_end}"}), 400
 
-        df_hist   = df_all[df_all["Date"] <= end_dt].copy()
-        df_future = df_all[df_all["Date"] >  end_dt].head(forecast_bars).copy()
+        # 找歷史截止 index
+        mask = df_all["Date"] <= end_dt
+        if not mask.any():
+            return jsonify({"error": "找不到指定日期之前的資料"}), 400
+        train_end_idx = int(mask.values.nonzero()[0][-1]) + 1
+
+        df_hist          = df_all.iloc[:train_end_idx]
+        actual_future_df = df_all.iloc[train_end_idx: train_end_idx + forecast_bars].copy()
 
         if len(df_hist) < 100:
             return jsonify({"error": "end_date 之前的歷史資料不足 100 根"}), 400
 
-        medoid_path, meta, used_cache = run_simulation(
-            df_hist=df_hist,
-            symbol=symbol,
-            forecast_bars=forecast_bars,
-            n_sim_paths=n_sim_paths,
-            seed=seed,
+        # 讀取 Pipeline cache
+        theta = load_pipeline_theta(symbol)
+        if theta is None:
+            return jsonify({
+                "error": (
+                    f"尚未找到 cache/{symbol}_theta.json，"
+                    "請先執行 python scripts/run_pipeline.py "
+                    f"--symbol {symbol} 產生 pipeline cache"
+                )
+            }), 400
+
+        agent_profile     = load_pipeline_agent_profile(symbol)
+        param_model       = load_pipeline_param_model(symbol)
+        vix_series        = _load_vix_series(str(CACHE_DIR))
+
+        # SimArgs：對應 rolling_forward._run_one_step 所有 args 屬性
+        class SimArgs:
+            def __init__(self):
+                self.step              = step
+                self.total_bars        = forecast_bars
+                self.lookback          = hist_bars
+                self.n_paths           = n_sim_paths
+                self.calib_window      = 500
+                self.no_garch          = False
+                self.garch_model       = "gjr-garch"
+                self.auto_calibrate    = True
+                self.short_drift_weight= 0.4
+                self.sr_window         = 90
+                self.sr_bins           = 40
+                self.sr_top_k          = 5
+                self.sr_pivot_order    = 5
+                self.sr_zone_pct       = 0.035
+                self.no_sr             = False
+                self.dynamic_drift     = True
+                self.mr_rate           = 0.08
+                self.trend_strength    = 0.5
+                self.vol_refit         = 5
+                self.early_decay_bars  = 5
+                self.reversal_window   = 3
+                self.verbose           = False
+
+        args = SimArgs()
+
+        # 呼叫核心引擎
+        result = rolling_forward(
+            df=df_all,
+            train_end_idx=train_end_idx,
+            theta=theta,
+            args=args,
+            actual_future_df=actual_future_df if not actual_future_df.empty else None,
+            param_model_payload=param_model,
+            agent_profile=agent_profile,
+            vix_series=vix_series,
         )
 
-        # 時間軸
-        last_date = df_hist["Date"].iloc[-1]
-        if not df_future.empty:
-            future_dates = df_future["Date"].tolist()
-        else:
-            future_dates = []
-            d = last_date
-            while len(future_dates) < forecast_bars:
-                d += timedelta(days=1)
-                if d.weekday() < 5:
-                    future_dates.append(d)
-        while len(future_dates) < forecast_bars:
-            d = future_dates[-1] + timedelta(days=1)
-            while d.weekday() >= 5:
-                d += timedelta(days=1)
-            future_dates.append(d)
+        # 展平分段 OHLC（pred_ohlcs 是 list of dict{open/high/low/close: np.ndarray}）
+        sim_candles_raw: list[dict] = []
+        for rnd_ohlc in result["pred_ohlcs"]:
+            if rnd_ohlc is None:
+                continue
+            opens  = rnd_ohlc["open"]
+            highs  = rnd_ohlc["high"]
+            lows   = rnd_ohlc["low"]
+            closes = rnd_ohlc["close"]
+            for i in range(len(opens)):
+                sim_candles_raw.append({
+                    "open":  round(float(opens[i]),  4),
+                    "high":  round(float(highs[i]),  4),
+                    "low":   round(float(lows[i]),   4),
+                    "close": round(float(closes[i]), 4),
+                })
 
-        future_ts = [int(pd.Timestamp(d).timestamp()) for d in future_dates[:forecast_bars]]
+        # 時間軸對齊
+        future_dates = actual_future_df["Date"].tolist() if not actual_future_df.empty else []
+        d = future_dates[-1] if future_dates else end_dt
+        while len(future_dates) < forecast_bars:
+            d += timedelta(days=1)
+            if d.weekday() < 5:
+                future_dates.append(d)
+
+        future_ts = [int(pd.Timestamp(dt).timestamp()) for dt in future_dates[:forecast_bars]]
         sim_candles = [
             {"time": future_ts[i], **bar}
-            for i, bar in enumerate(medoid_path)
+            for i, bar in enumerate(sim_candles_raw)
             if i < len(future_ts)
         ]
-        bb_fwd = meta["bb_fwd"]
-        backbone_line = [
-            {"time": future_ts[i], "value": round(float(bb_fwd[i]), 4)}
-            for i in range(min(len(bb_fwd), len(future_ts)))
-        ]
 
-        ap = meta["auto_params"]
-        th = meta["theta"]
-        cache_tag = "pipeline cache" if used_cache else "live estimate"
-        agent_tag = "agent ON" if meta["agent_active"] else "agent OFF"
+        # 組合 tag
+        cache_tag = "pipeline cache"
+        agent_tag = "agent ON"  if agent_profile else "agent OFF"
+        model_tag = "model ON"  if param_model   else "model OFF"
 
         return jsonify({
             "symbol":         symbol,
             "end_date":       end_date_str,
             "hist_candles":   df_to_ohlc_list(df_hist.tail(hist_bars)),
-            "actual_candles": df_to_ohlc_list(df_future),
+            "actual_candles": df_to_ohlc_list(actual_future_df),
             "sim_candles":    sim_candles,
-            "backbone_line":  backbone_line,
+            "backbone_line":  [],   # rolling 模式下骨幹每輪重建，此處留空
             "n_sim_paths":    n_sim_paths,
-            "auto_params":    ap,
-            "theta":          th,
-            "blend_drift":    meta["blend_drift"],
-            "cache_tag":      cache_tag,
-            "agent_tag":      agent_tag,
+            "auto_params":    {
+                "drift_scale":    "Dynamic",
+                "drift_decay":    "Dynamic",
+                "vol_multiplier": "Dynamic",
+            },
+            "theta":       {"vol": round(theta.vol, 5), "mr_coeff": round(theta.mr_coeff, 5)},
+            "blend_drift": "Dynamic",
+            "cache_tag":   cache_tag,
+            "agent_tag":   agent_tag,
+            "model_tag":   model_tag,
         })
 
     except Exception as e:
@@ -545,6 +533,7 @@ HTML = r"""
   <div class="ctrl-group"><label>股票</label><input type="text" id="symbol" value="AAPL" /></div>
   <div class="ctrl-group"><label>截止日</label><input type="date" id="end-date" value="2024-06-01" /></div>
   <div class="ctrl-group"><label>預測根數</label><input type="number" id="forecast-bars" value="30" min="5" max="120" /></div>
+  <div class="ctrl-group"><label>滾動步長</label><input type="number" id="rolling-step" value="5" min="1" max="30" /></div>
   <div class="ctrl-group"><label>歷史顯示根數</label><input type="number" id="hist-bars" value="60" min="20" max="250" /></div>
   <div class="ctrl-group"><label>模擬路徑數</label><input type="number" id="n-sim-paths" value="500" min="50" max="2000" /></div>
   <div class="ctrl-group"><label>顯示骨幹</label><input type="checkbox" id="show-backbone" checked /></div>
@@ -556,8 +545,7 @@ HTML = r"""
   <div id="chart"></div>
   <div id="legend">
     <div><span class="legend-dot" style="background:#6b7280"></span>歷史 K 棒</div>
-    <div><span class="legend-dot" style="background:#4f98a3"></span>模擬（Medoid）</div>
-    <div><span class="legend-dot" style="background:#ff9900"></span>骨幹走勢</div>
+    <div><span class="legend-dot" style="background:#4f98a3"></span>模擬（Rolling Medoid）</div>
     <div><span class="legend-dot" style="background:#f0c040"></span>實際走勢</div>
   </div>
   <div id="loading"><div class="spinner"></div><span id="loading-text">模擬中...</span></div>
@@ -631,12 +619,13 @@ async function runSim() {
   const symbol       = document.getElementById('symbol').value.trim().toUpperCase();
   const endDate      = document.getElementById('end-date').value;
   const forecastBars = parseInt(document.getElementById('forecast-bars').value);
+  const step         = parseInt(document.getElementById('rolling-step').value) || 5;
   const histBars     = parseInt(document.getElementById('hist-bars').value);
   const nSimPaths    = parseInt(document.getElementById('n-sim-paths').value) || 500;
 
   if (!symbol || !endDate) { showToast('請填寫股票代碼和截止日'); return; }
 
-  setLoading(true, `模擬中（${nSimPaths} 條路徑）...`);
+  setLoading(true, `Rolling 模擬中（步長 ${step}，${nSimPaths} 條路徑）...`);
   document.getElementById('run-btn').disabled   = true;
   document.getElementById('resim-btn').disabled = true;
 
@@ -648,6 +637,7 @@ async function runSim() {
         symbol, end_date: endDate,
         forecast_bars: forecastBars, hist_bars: histBars,
         n_sim_paths: nSimPaths,
+        step: step,
         seed: Math.floor(Math.random() * 99999),
       }),
     });
@@ -657,27 +647,26 @@ async function runSim() {
     if (!chart) initChart();
     renderData(data);
 
-    const ap = data.auto_params, th = data.theta;
-    const cacheTag = data.cache_tag === 'pipeline cache'
-      ? '<span class="tag tag-green">pipeline cache</span>'
-      : '<span class="tag tag-muted">live estimate</span>';
+    const th = data.theta || {};
+    const cacheTag = '<span class="tag tag-green">pipeline cache</span>';
     const agentTag = data.agent_tag === 'agent ON'
       ? '<span class="tag tag-orange">agent ON</span>'
       : '<span class="tag tag-muted">agent OFF</span>';
+    const modelTag = data.model_tag === 'model ON'
+      ? '<span class="tag tag-teal">model ON</span>'
+      : '<span class="tag tag-muted">model OFF</span>';
 
     document.getElementById('info-text').innerHTML = [
       `<span class="tag tag-muted">${data.symbol}  截至 ${data.end_date}</span>`,
       cacheTag,
       agentTag,
+      modelTag,
+      `<span>Rolling step=<b>${step}</b></span>`,
       `<span>Medoid / <b>${data.n_sim_paths}</b> 條</span>`,
-      `<span>blend_drift <b>${data.blend_drift}</b></span>`,
-      `<span>drift_scale <b>${ap.drift_scale}</b></span>`,
-      `<span>drift_decay <b>${ap.drift_decay}</b></span>`,
-      `<span>vol_mult <b>${ap.vol_multiplier}</b></span>`,
-      `<span>theta.vol <b>${th.vol}</b></span>`,
-      `<span>theta.mr <b>${th.mr_coeff}</b></span>`,
+      `<span>theta.vol <b>${th.vol ?? '-'}</b></span>`,
+      `<span>theta.mr <b>${th.mr_coeff ?? '-'}</b></span>`,
       `<span class="tag tag-yellow">黃=實際</span>`,
-      `<span class="tag tag-teal">藍綠=Medoid</span>`,
+      `<span class="tag tag-teal">藍綠=Rolling Medoid</span>`,
     ].join('');
 
     document.getElementById('resim-btn').disabled = false;
