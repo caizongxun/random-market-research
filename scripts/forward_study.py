@@ -1,38 +1,43 @@
 """
-forward_study.py  v11.6  (GJR-GARCH + auto-calibrate + OHLC K線預測)
+forward_study.py  v12.0  (動態 drift — trend-follow + mean-revert + vol-regime)
 
-v11.6 修正：
+v12.0 新增：dynamic_drift_schedule()
+  每根 K 棒的 drift 不再是固定衰減，而由三個力量疊加決定：
+
+  1. Trend-follow component
+     - 以「近 5 日 log-ret 均值」作為 momentum signal
+     - blend_drift 作為基準，乘以 (1 + trend_strength × momentum_sign)
+     - 每根衰減 drift_decay（同舊邏輯）
+
+  2. Mean-revert component
+     - 追蹤「目前路徑相對 BB backbone 的偏離量」
+     - 偏離越多 → 往 backbone 拉的修正力越強
+     - 係數 mr_rate（預設 0.08）
+
+  3. Vol-regime scaling
+     - 用 GJR-GARCH 滾動更新 σ_t（每 refit_every 根更新一次）
+     - drift 振幅乘以 vol_regime_scale = σ_0 / σ_t（壓縮高波時的方向性）
+     - 截斷在 [0.5, 2.0] 之間
+
+  回傳 np.ndarray shape=(forecast,) 的 drift_schedule。
+
+v11.6 已有：
   支撐/壓力語義修正
-  - pivot_low（前期低點）只能被選為支撐（低於現價）
-  - pivot_high（前期高點）只能被選為壓力（高於現價）
-  - histogram 密集帶：仍依「低於起點 = 支撐，高於起點 = 壓力」分配（無語義限制）
-  - 修正前：兩組極值點全進合併池，導致前期高點被誤分為支撐（反之亦然）
+  - pivot_low 只能被選為支撐（低於現價）
+  - pivot_high 只能被選為壓力（高於現價）
 
 v11.5 已有：
   支撐/壓力偵測 — 雙軌合併法
-  - 方法一：價格密度直方圖（保留）找成交密集帶
-  - 方法二：局部低點/高點聚集（新增）找前期 swing low/high
-  - 兩組水平線合併後取距起點最近者作為支撐/壓力
-  - 門檻放寬：支撐/壓力觸發距離 2% → 3.5%（讓更多情境觸發）
-  - Verbose 額外顯示 [支撐壓力] 區塊，標示水平線來源（histogram/pivot）
 
 v11.4 已有：
-  支撐/壓力偵測 (price density histogram)
-  - 若起點距支撐 < 3.5% → blend_drift 往多頭方向修正（最大 +0.05%/day）
-  - 若起點距壓力 < 3.5% → blend_drift 往空頭方向修正（最大 -0.03%/day）
+  支撐/壓力 drift 修正
 
 v11.3 已有：
-  1. momentum 翻轉偵測 — 連漲 N 根且 blend_drift < 0 時 momentum_bias 歸零
-  2. 前期快速衰減 — drift 在前 10 根後以 2× 速率衰減
+  1. momentum 翻轉偵測
+  2. 前期快速衰減
 
 v11.2 已有：
   blend_drift 動態截斷 MAX = 0.5 × σ_garch
-
-v11.1 已有：
-  print_ohlc_comparison() — 每根 K 棒對照表
-
-v11 已有：
-  momentum_bias + node_breakout_state
 
 用法：
   python scripts/forward_study.py \\
@@ -40,6 +45,23 @@ v11 已有：
     --theta results/theta_aapl.json \\
     --auto-calibrate \\
     --verbose
+
+  # 開啟動態 drift（預設啟用）
+  python scripts/forward_study.py \\
+    --symbol AAPL \\
+    --theta results/theta_aapl.json \\
+    --auto-calibrate \\
+    --dynamic-drift \\
+    --mr-rate 0.08 \\
+    --trend-strength 0.5 \\
+    --verbose
+
+  # 停用（回到 v11 靜態衰減）
+  python scripts/forward_study.py \\
+    --symbol AAPL \\
+    --theta results/theta_aapl.json \\
+    --auto-calibrate \\
+    --no-dynamic-drift
 """
 
 from __future__ import annotations
@@ -113,10 +135,6 @@ def find_support_resistance(
     n_bins: int = 40,
     top_k: int = 3,
 ):
-    """
-    用近 `window` 根收盤價建直方圖，找成交最密集的 top_k 個價位帶。
-    回傳 sorted list of (price, source) tuples，source = 'histogram'。
-    """
     prices = close_arr[-window:] if len(close_arr) >= window else close_arr
     counts, edges = np.histogram(prices, bins=n_bins)
     bin_centers = 0.5 * (edges[:-1] + edges[1:])
@@ -134,14 +152,6 @@ def find_local_extrema(
     order: int = 5,
     cluster_pct: float = 0.015,
 ):
-    """
-    在近 `window` 根收盤價中找局部低點（swing low）與高點（swing high）。
-    - order: 左右各 `order` 根都低/高才算極值點
-    - cluster_pct: 距離在 cluster_pct 以內的極值點合併為一個聚集水平
-
-    回傳 (swing_lows, swing_highs)，各為 list of (price, source) tuples，
-    source = 'pivot_low' or 'pivot_high'。
-    """
     prices = np.asarray(close_arr[-window:] if len(close_arr) >= window else close_arr)
     n = len(prices)
 
@@ -172,7 +182,7 @@ def find_local_extrema(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 支撐/壓力修正主函式（雙軌合併）
+# 支撐/壓力修正主函式（雙軌合併，v11.6 語義修正）
 # ──────────────────────────────────────────────────────────────────────────────
 def compute_sr_drift_adjustment(
     close_arr,
@@ -182,42 +192,27 @@ def compute_sr_drift_adjustment(
     top_k: int = 5,
     pivot_order: int = 5,
     pivot_cluster_pct: float = 0.015,
-    support_zone_pct: float = 0.035,   # ← 放寬至 3.5%
-    resist_zone_pct: float = 0.035,    # ← 放寬至 3.5%
-    max_support_pull: float = 0.0005,  # 最大多頭修正 +0.05%/day
-    max_resist_push: float = 0.0003,   # 最大空頭修正 -0.03%/day
+    support_zone_pct: float = 0.035,
+    resist_zone_pct: float = 0.035,
+    max_support_pull: float = 0.0005,
+    max_resist_push: float = 0.0003,
 ):
-    """
-    雙軌合併（v11.6 語義修正版）：
-      1. 直方圖密集帶（方法一）：低於起點 → 支撐候選；高於起點 → 壓力候選
-      2. pivot_low（前期低點）：只能作為支撐候選（必須低於起點）
-         pivot_high（前期高點）：只能作為壓力候選（必須高於起點）
-
-    合併後分別取最近支撐與最近壓力，套用線性插值修正 blend_drift。
-    回傳 (drift_adj, sr_info_dict)
-    """
-    # 方法一：直方圖（無語義限制，依位置分配）
     hist_levels = find_support_resistance(
         close_arr, window=sr_window, n_bins=n_bins, top_k=top_k
     )
     hist_supports    = [(lv, src) for lv, src in hist_levels if lv < start_price]
     hist_resistances = [(lv, src) for lv, src in hist_levels if lv > start_price]
 
-    # 方法二：pivot — 語義嚴格分配
     pivot_lows, pivot_highs = find_local_extrema(
         close_arr, window=sr_window, order=pivot_order,
         cluster_pct=pivot_cluster_pct,
     )
-    # pivot_low 只做支撐（必須低於起點）
     pivot_supports    = [(lv, src) for lv, src in pivot_lows  if lv < start_price]
-    # pivot_high 只做壓力（必須高於起點）
     pivot_resistances = [(lv, src) for lv, src in pivot_highs if lv > start_price]
 
-    # 合併各自候選池
     supports    = hist_supports    + pivot_supports
     resistances = hist_resistances + pivot_resistances
 
-    # 取最近的支撐/壓力
     nearest_support_tuple  = max(supports,    key=lambda x: x[0]) if supports    else None
     nearest_resist_tuple   = min(resistances, key=lambda x: x[0]) if resistances else None
 
@@ -255,6 +250,101 @@ def compute_sr_drift_adjustment(
         "zone_pct":          support_zone_pct,
     }
     return drift_adj, sr_info
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v12：動態 drift schedule
+# ──────────────────────────────────────────────────────────────────────────────
+def dynamic_drift_schedule(
+    close_hist: np.ndarray,
+    blend_drift: float,
+    backbone_schedule: np.ndarray,     # shape (forecast,)  backbone 中位路徑價格
+    forecast: int,
+    drift_decay: float       = 0.04,
+    early_decay_bars: int    = 10,
+    mr_rate: float           = 0.08,   # 均值回歸係數
+    trend_strength: float    = 0.5,    # trend-follow 放大係數
+    vol_regime_refit: int    = 5,      # 每幾根重新估 vol
+    garch_model: str         = "gjr-garch",
+    drift_clamp_max: float | None = None,
+    momentum_signal: float   = 0.0,    # 外部傳入的 short_drift
+) -> tuple[np.ndarray, list[dict]]:
+    """
+    每根 K 棒的 drift 由三個分量疊加：
+
+        d_t = d_base_t                     ← 衰減的基礎 drift
+            + trend_t                      ← trend-follow 放大
+            + mr_t                         ← mean-revert 向 backbone 拉
+            × vol_regime_scale_t           ← vol-regime 壓縮/放大
+
+    回傳：
+        drift_schedule  : np.ndarray shape=(forecast,)
+        debug_log       : list[dict]  每根的分量細節
+    """
+    log_rets = np.diff(np.log(close_hist))
+
+    # 初始 vol 估計（作為基準 σ₀）
+    sigma_0, _ = garch_vol_forecast(close_hist, model_type=garch_model) \
+        if _ARCH_AVAILABLE else (None, {})
+    if sigma_0 is None or sigma_0 <= 0:
+        sigma_0 = float(np.std(log_rets[-21:])) if len(log_rets) >= 21 else float(np.std(log_rets))
+
+    fast_decay  = min(drift_decay * 2.0, 0.99)
+    base_decay  = drift_decay
+
+    current_drift = blend_drift
+    # 模擬路徑用來計算偏離 backbone（以 log-price 追蹤）
+    sim_log_price = np.log(float(close_hist[-1]))
+    sigma_t       = sigma_0
+
+    drift_schedule = np.empty(forecast)
+    debug_log      = []
+
+    for t in range(forecast):
+        # ── 1. 衰減基礎 ──
+        decay = fast_decay if t < early_decay_bars else base_decay
+        current_drift *= (1.0 - decay)
+
+        # ── 2. Trend-follow ──
+        mom_sign = np.sign(momentum_signal) if abs(momentum_signal) > 1e-8 else 0.0
+        trend_component = trend_strength * abs(current_drift) * mom_sign
+
+        # ── 3. Mean-revert 向 backbone ──
+        bb_log = np.log(float(backbone_schedule[t]) + 1e-10)
+        mr_component = mr_rate * (bb_log - sim_log_price)
+
+        # ── 4. Vol-regime scaling（每 vol_regime_refit 根重估）──
+        if _ARCH_AVAILABLE and t % vol_regime_refit == 0 and t > 0:
+            # 用假想的歷史 + 模擬 drift 估計 sigma_t（輕量：只更新 EWMA）
+            ewma_sigma = float(np.sqrt(
+                0.94 * sigma_t ** 2 + 0.06 * current_drift ** 2
+            ))
+            sigma_t = max(ewma_sigma, 1e-6)
+
+        vol_scale_t = float(np.clip(sigma_0 / (sigma_t + 1e-8), 0.5, 2.0))
+
+        # ── 合併 ──
+        d_t = (current_drift + trend_component + mr_component) * vol_scale_t
+
+        # ── clamp ──
+        if drift_clamp_max is not None and drift_clamp_max > 0:
+            d_t = float(np.clip(d_t, -drift_clamp_max, drift_clamp_max))
+
+        drift_schedule[t] = d_t
+
+        # 更新模擬路徑（用以計算下一步偏離量）
+        sim_log_price += d_t
+
+        debug_log.append({
+            "t":               t,
+            "base_drift":      round(current_drift * 100, 5),
+            "trend":           round(trend_component * 100, 5),
+            "mr":              round(mr_component * 100, 5),
+            "vol_scale":       round(vol_scale_t, 4),
+            "final_drift":     round(d_t * 100, 5),
+        })
+
+    return drift_schedule, debug_log
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -332,18 +422,23 @@ def parse_args():
     p.add_argument("--early-decay-bars", type=int, default=10,
                    help="前 N 根使用 2× drift_decay，之後恢復正常 (預設 10)")
     # 支撐壓力
-    p.add_argument("--sr-window",      type=int,   default=90,
-                   help="支撐壓力掃描窗口（根數，預設 90）")
-    p.add_argument("--sr-bins",        type=int,   default=40,
-                   help="直方圖 bin 數（預設 40）")
-    p.add_argument("--sr-top-k",       type=int,   default=5,
-                   help="直方圖前 K 個密集帶（預設 5）")
-    p.add_argument("--sr-pivot-order", type=int,   default=5,
-                   help="局部低/高點左右各需幾根確認（預設 5）")
-    p.add_argument("--sr-zone-pct",    type=float, default=0.035,
-                   help="支撐/壓力觸發距離門檻（預設 0.035 = 3.5%%）")
-    p.add_argument("--no-sr",           action="store_true",
-                   help="停用支撐壓力 drift 修正")
+    p.add_argument("--sr-window",      type=int,   default=90)
+    p.add_argument("--sr-bins",        type=int,   default=40)
+    p.add_argument("--sr-top-k",       type=int,   default=5)
+    p.add_argument("--sr-pivot-order", type=int,   default=5)
+    p.add_argument("--sr-zone-pct",    type=float, default=0.035)
+    p.add_argument("--no-sr",           action="store_true")
+    # v12：動態 drift
+    p.add_argument("--dynamic-drift",   action="store_true", default=True,
+                   help="啟用動態 drift schedule（預設啟用）")
+    p.add_argument("--no-dynamic-drift", dest="dynamic_drift", action="store_false",
+                   help="停用動態 drift，回到 v11 靜態衰減")
+    p.add_argument("--mr-rate",        type=float, default=0.08,
+                   help="mean-revert 向 backbone 的係數（預設 0.08）")
+    p.add_argument("--trend-strength", type=float, default=0.5,
+                   help="trend-follow 放大係數（預設 0.5）")
+    p.add_argument("--vol-refit",      type=int,   default=5,
+                   help="vol-regime EWMA 每幾根更新一次（預設 5）")
     return p.parse_args()
 
 
@@ -380,8 +475,6 @@ def auto_calibrate(
     momentum_boost = 0.8
     drift_decay    = float(np.clip(0.02 + rv * 1.5, 0.03, 0.15))
     drift_scale    = float(np.clip(rv / max(theta.vol, 1e-8), 0.4, 3.0))
-
-    # 動態 drift 截斷上限：0.5 × σ (每日)
     drift_clamp_max = float(base_vol * 0.5)
 
     return {
@@ -408,9 +501,10 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
                       blend_drift: float = 0.0, short_drift: float = 0.0,
                       last_drift: float = 0.0, drift_clamp_max: float | None = None,
                       momentum_reversed: bool = False,
-                      sr_info: dict | None = None):
+                      sr_info: dict | None = None,
+                      drift_debug: list[dict] | None = None):
     print("\n" + "─" * 60)
-    print("  VERBOSE DIAGNOSTICS (v11.6)")
+    print("  VERBOSE DIAGNOSTICS (v12.0)")
     print("─" * 60)
     if calib_info:
         gi  = calib_info.get("_garch_info", {})
@@ -425,7 +519,7 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
         elif "error" in gi:
             print(f"  GARCH error   : {gi['error']}")
     print(f"\n  [動能狀態]")
-    print(f"  momentum_bias   : {momentum_bias:+.4f}  (estimator 原值，不歸零)")
+    print(f"  momentum_bias   : {momentum_bias:+.4f}")
     print(f"  breakout_state  : {breakout_state}")
     if momentum_reversed:
         print(f"  ⚡ momentum 翻轉偵測：連漲 {args.reversal_window} 根 + blend_drift<0 → momentum_bias 歸零")
@@ -441,42 +535,50 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
     if drift_clamp_max:
         print(f"  drift_clamp_max : ±{drift_clamp_max*100:.4f}%/day  (0.5×σ_garch)")
 
-    # ── 支撐壓力區塊 ──
+    # 支撐壓力
     if sr_info is not None:
         zone_pct = sr_info.get("zone_pct", 0.035)
-        print(f"\n  [支撐壓力]  門檻={zone_pct*100:.1f}%  (直方圖 + pivot_low/pivot_high 語義分配)")
-        ns    = sr_info.get("near_support")
-        ns_src= sr_info.get("near_support_src", "")
-        nr    = sr_info.get("near_resist")
-        nr_src= sr_info.get("near_resist_src", "")
-        sp    = sr_info.get("support_pull", 0.0)
-        rp    = sr_info.get("resist_push",  0.0)
-        da    = sr_info.get("drift_adj",    0.0)
+        print(f"\n  [支撐壓力]  門檻={zone_pct*100:.1f}%")
+        ns     = sr_info.get("near_support")
+        ns_src = sr_info.get("near_support_src", "")
+        nr     = sr_info.get("near_resist")
+        nr_src = sr_info.get("near_resist_src", "")
+        sp     = sr_info.get("support_pull", 0.0)
+        rp     = sr_info.get("resist_push",  0.0)
+        da     = sr_info.get("drift_adj",    0.0)
         if ns is not None:
             dist_s = sr_info.get("dist_support", 0.0)
             pull_str = f"→ drift +{sp*100:.4f}%/day" if sp > 0 else f"(距離 > {zone_pct*100:.1f}%，無修正)"
             print(f"  near_support  : {ns:.2f}  [{ns_src}]  (距起點 -{dist_s*100:.2f}%)  {pull_str}")
         else:
-            print(f"  near_support  : 無（近期無符合語義的支撐水平）")
+            print(f"  near_support  : 無")
         if nr is not None:
             dist_r = sr_info.get("dist_resist", 0.0)
             push_str = f"→ drift -{rp*100:.4f}%/day" if rp > 0 else f"(距離 > {zone_pct*100:.1f}%，無修正)"
             print(f"  near_resist   : {nr:.2f}  [{nr_src}]  (距起點 +{dist_r*100:.2f}%)  {push_str}")
         else:
-            print(f"  near_resist   : 無（近期無符合語義的壓力水平）")
+            print(f"  near_resist   : 無")
         if abs(da) > 1e-9:
-            print(f"  ✅ SR drift 修正 : {da*100:+.4f}%/day  (已加入 blend_drift)")
-        else:
-            print(f"  SR drift 修正 : 0（起點不在任何支撐/壓力帶附近）")
+            print(f"  ✅ SR drift 修正 : {da*100:+.4f}%/day")
 
-    print(f"\n  [前期快速衰減]")
-    print(f"  early_decay_bars: {args.early_decay_bars} 根  (2×drift_decay → 正常)")
+    # v12 動態 drift 摘要
+    if drift_debug:
+        print(f"\n  [動態 drift schedule (v12)]  前5根：")
+        hdr = f"  {'t':>3}  {'base%':>8}  {'trend%':>8}  {'mr%':>8}  {'vol_scale':>9}  {'final%':>8}"
+        print(hdr)
+        for row in drift_debug[:5]:
+            print(f"  {row['t']:>3}  {row['base_drift']:>8.4f}  {row['trend']:>8.4f}  "
+                  f"{row['mr']:>8.4f}  {row['vol_scale']:>9.4f}  {row['final_drift']:>8.4f}")
+        if len(drift_debug) > 5:
+            print(f"  ... (共 {len(drift_debug)} 根)")
+
     print(f"\n  [最終模擬參數]")
     print(f"  intra_bar       : {args.intra_bar}")
     print(f"  momentum_boost  : {args.momentum_boost}")
     print(f"  drift_decay     : {args.drift_decay}")
     print(f"  vol_multiplier  : {args.vol_multiplier}")
     print(f"  drift_scale     : {args.drift_scale}")
+    print(f"  dynamic_drift   : {args.dynamic_drift}  (mr_rate={args.mr_rate}  trend_strength={args.trend_strength})")
     if model_predicted_params:
         print(f"\n  [param-model 覆蓋]")
         print(f"  drift_scale   : {model_predicted_params.get('drift_scale', 'N/A')}")
@@ -514,15 +616,13 @@ def print_ohlc_comparison(
     prev_act_c   = start_price
     cum_pred_ret = 0.0
     cum_act_ret  = 0.0
-
-    close_errs = []
+    close_errs   = []
 
     for i in range(n):
         p_c = float(pred_close[i])
         p_o = float(pred_ohlc["open"][i])  if has_pred_ohlc else float(pred_close[i - 1] if i > 0 else start_price)
         p_h = float(pred_ohlc["high"][i])  if has_pred_ohlc else p_c * 1.005
         p_l = float(pred_ohlc["low"][i])   if has_pred_ohlc else p_c * 0.995
-
         p_ret = (p_c - prev_pred_c) / prev_pred_c * 100
 
         if has_actual and i < len(actual_df):
@@ -532,19 +632,15 @@ def print_ohlc_comparison(
             a_l   = float(row.get("Low",   row.get("low",   p_l)))
             a_c   = float(row.get("Close", row.get("close", p_c)))
             a_ret = (a_c - prev_act_c) / prev_act_c * 100
-
             cls_err = (p_c - a_c) / a_c * 100
             close_errs.append(abs(cls_err))
-
             p_dir = "+" if p_c >= prev_pred_c else "-"
             a_dir = "+" if a_c >= prev_act_c  else "-"
             dir_match = "✓" if p_dir == a_dir else "✗"
-
             print(f"  {i+1:>3}  "
                   f"{p_o:>8.2f} {p_h:>8.2f} {p_l:>8.2f} {p_c:>8.2f} {p_ret:>+7.2f}%  "
                   f"{a_o:>8.2f} {a_h:>8.2f} {a_l:>8.2f} {a_c:>8.2f} {a_ret:>+7.2f}%  "
                   f"{cls_err:>+8.2f}% {dir_match:>4}")
-
             prev_act_c  = a_c
             cum_act_ret = (a_c - start_price) / start_price * 100
         else:
@@ -552,7 +648,6 @@ def print_ohlc_comparison(
                   f"{p_o:>8.2f} {p_h:>8.2f} {p_l:>8.2f} {p_c:>8.2f} {p_ret:>+7.2f}%  "
                   f"{'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>7}  "
                   f"{'N/A':>8} {'N/A':>4}")
-
         prev_pred_c = p_c
         cum_pred_ret = (p_c - start_price) / start_price * 100
 
@@ -603,8 +698,13 @@ def render_forecast(
     actual_close=None,
     actual_ohlc: dict | None = None,
     sr_info: dict | None = None,
+    drift_schedule: np.ndarray | None = None,
 ):
-    fig, ax = plt.subplots(figsize=(15, 6))
+    fig, axes = plt.subplots(2, 1, figsize=(15, 9),
+                             gridspec_kw={"height_ratios": [3, 1]},
+                             sharex=False)
+    ax   = axes[0]
+    ax_d = axes[1]
 
     hist_x = np.arange(-len(hist_close), 0)
     ax.plot(hist_x, hist_close, color="#555555", lw=1.2, label="歷史收盤", zorder=4)
@@ -636,7 +736,6 @@ def render_forecast(
     bull_patch = mpatches.Patch(color="#26A69A", label="預測漲K")
     bear_patch = mpatches.Patch(color="#EF5350", label="預測跌K")
 
-    # 畫支撐/壓力水平線（標示來源）
     if sr_info is not None:
         ns     = sr_info.get("near_support")
         ns_src = sr_info.get("near_support_src", "")
@@ -662,7 +761,6 @@ def render_forecast(
 
     ax.axvline(0, color="#999999", lw=0.8, ls=":")
     ax.set_title(f"{symbol}  {end_date_str}  [{mode_tag}]")
-    ax.set_xlabel("交易日（相對預測起點）")
     ax.set_ylabel("價格")
 
     handles, labels = ax.get_legend_handles_labels()
@@ -671,6 +769,20 @@ def render_forecast(
               loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3)
 
+    # ── 下圖：動態 drift ──
+    if drift_schedule is not None and len(drift_schedule) > 0:
+        colors = ["#26A69A" if d >= 0 else "#EF5350" for d in drift_schedule]
+        ax_d.bar(np.arange(len(drift_schedule)), drift_schedule * 100,
+                 color=colors, width=0.6, alpha=0.8)
+        ax_d.axhline(0, color="#888888", lw=0.7)
+        ax_d.set_ylabel("drift (%/day)")
+        ax_d.set_xlabel("交易日（相對預測起點）")
+        ax_d.set_title("動態 drift schedule (v12)", fontsize=9)
+        ax_d.grid(True, alpha=0.2)
+    else:
+        ax_d.set_visible(False)
+
+    fig.tight_layout()
     out   = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     fname = out / f"{symbol}_{end_date_str}_{mode_tag}.png"
@@ -859,7 +971,7 @@ def main():
     if args.auto_calibrate:
         calib_window = args.calib_window
         model_label  = args.garch_model if use_garch else "rv"
-        print(f"\n[auto-calibrate v11.6] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
+        print(f"\n[auto-calibrate v12.0] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             df.iloc[:train_end_idx]["Close"].values.astype(float),
             theta,
@@ -916,7 +1028,7 @@ def main():
     w            = float(np.clip(args.short_drift_weight, 0.0, 1.0))
     blend_drift  = w * short_drift + (1.0 - w) * last_drift
 
-    # ── v11.2：動態截斷 blend_drift ──
+    # ── 動態截斷 blend_drift ──
     drift_clamp_max = args.drift_clamp
     if drift_clamp_max is not None and drift_clamp_max > 0:
         blend_drift_raw = blend_drift
@@ -925,7 +1037,7 @@ def main():
             print(f"  [drift clamp] {blend_drift_raw*100:+.4f}%/day → {blend_drift*100:+.4f}%/day  "
                   f"(MAX=±{drift_clamp_max*100:.4f}%/day)")
 
-    # ── v11.6：支撐壓力修正 blend_drift（pivot 語義修正版）──
+    # ── 支撐壓力修正 ──
     sr_info: dict | None = None
     if not args.no_sr:
         sr_close_arr = df.iloc[:train_end_idx]["Close"].values.astype(float)
@@ -941,15 +1053,15 @@ def main():
         )
         if abs(drift_adj) > 1e-9:
             blend_drift += drift_adj
-            # 修正後再 clamp 一次，防止修正後超出上限
             if drift_clamp_max is not None and drift_clamp_max > 0:
                 blend_drift = float(np.clip(blend_drift, -drift_clamp_max, drift_clamp_max))
 
-    drift_fwd = np.full(args.forecast, blend_drift)
-    vol_fwd   = np.full(args.forecast, last_vol) * (args.vol_multiplier or 1.0)
-    bb_fwd    = start_price * np.cumprod(1 + drift_fwd)
+    # ── v12：backbone forward schedule（供 mean-revert 參考）──
+    drift_fwd   = np.full(args.forecast, blend_drift)
+    bb_fwd      = start_price * np.cumprod(1 + drift_fwd)
+    vol_fwd     = np.full(args.forecast, last_vol) * (args.vol_multiplier or 1.0)
 
-    # ── estimator ──
+    # ── v11.3：momentum 翻轉偵測 ──
     ESTIMATOR_LB = 500
     rv_window    = min(21, len(close_hist))
     rv           = float(np.std(np.diff(np.log(close_hist[-rv_window:]))))
@@ -961,14 +1073,10 @@ def main():
     params_fwd  = build_params_from_theta(theta, base_params)
 
     import dataclasses
-    params_fwd = dataclasses.replace(
-        params_fwd,
-        last_close=start_price,
-    )
+    params_fwd = dataclasses.replace(params_fwd, last_close=start_price)
     momentum_bias   = float(getattr(params_fwd, "momentum_bias",       0.0))
     breakout_state  = int(getattr(params_fwd,   "node_breakout_state", 0))
 
-    # ── v11.3：momentum 翻轉偵測 ──
     momentum_reversed = False
     reversal_win = max(1, args.reversal_window)
     if blend_drift < 0 and len(log_ret_hist) >= reversal_win:
@@ -977,17 +1085,34 @@ def main():
             momentum_bias = 0.0
             momentum_reversed = True
 
-    # ── v11.3：前期快速衰減 drift schedule ──
-    early_bars  = max(0, args.early_decay_bars)
+    # ── v12：動態 drift schedule ──
     base_decay  = float(args.drift_decay or 0.04)
-    fast_decay  = min(base_decay * 2.0, 0.99)
+    drift_debug: list[dict] = []
 
-    drift_schedule = np.empty(args.forecast)
-    current_drift  = blend_drift
-    for t in range(args.forecast):
-        drift_schedule[t] = current_drift
-        decay = fast_decay if t < early_bars else base_decay
-        current_drift *= (1.0 - decay)
+    if args.dynamic_drift:
+        drift_schedule, drift_debug = dynamic_drift_schedule(
+            close_hist=close_hist,
+            blend_drift=blend_drift,
+            backbone_schedule=bb_fwd,
+            forecast=args.forecast,
+            drift_decay=base_decay,
+            early_decay_bars=args.early_decay_bars,
+            mr_rate=args.mr_rate,
+            trend_strength=args.trend_strength,
+            vol_regime_refit=args.vol_refit,
+            garch_model=args.garch_model,
+            drift_clamp_max=drift_clamp_max,
+            momentum_signal=short_drift,
+        )
+    else:
+        # 回退 v11 靜態衰減
+        fast_decay    = min(base_decay * 2.0, 0.99)
+        current_drift = blend_drift
+        drift_schedule = np.empty(args.forecast)
+        for t in range(args.forecast):
+            drift_schedule[t] = current_drift
+            decay = fast_decay if t < args.early_decay_bars else base_decay
+            current_drift *= (1.0 - decay)
 
     if args.verbose:
         print_diagnostics(
@@ -1000,21 +1125,23 @@ def main():
             drift_clamp_max=drift_clamp_max,
             momentum_reversed=momentum_reversed,
             sr_info=sr_info,
+            drift_debug=drift_debug if args.dynamic_drift else None,
         )
 
     # ── simulate ──
     end_date_str = end_dt.strftime("%Y-%m-%d")
-    print(f"\n[simulate] {args.symbol}  起點={end_date_str}  forecast={args.forecast}  n_paths={args.n_paths}")
+    dyn_tag = "dyn" if args.dynamic_drift else "static"
+    print(f"\n[simulate v12] {args.symbol}  起點={end_date_str}  forecast={args.forecast}  n_paths={args.n_paths}  drift={dyn_tag}")
     print(f"  blend_drift={blend_drift*100:+.4f}%/day  "
           f"(short={short_drift*100:+.4f}%  long={last_drift*100:+.4f}%  w={w})")
     if sr_info and abs(sr_info.get("drift_adj", 0.0)) > 1e-9:
-        print(f"  SR adj={sr_info['drift_adj']*100:+.4f}%/day  "
-              f"(support={sr_info.get('near_support')} [{sr_info.get('near_support_src')}]  "
-              f"resist={sr_info.get('near_resist')} [{sr_info.get('near_resist_src')}])")
+        print(f"  SR adj={sr_info['drift_adj']*100:+.4f}%/day")
     print(f"  momentum_bias={momentum_bias:+.4f}  breakout_state={breakout_state}"
           + ("  [翻轉歸零]" if momentum_reversed else ""))
-    print(f"  drift_scale={args.drift_scale}  drift_decay={base_decay}(fast={fast_decay:.4f} ×{early_bars}bars)  "
+    print(f"  drift_scale={args.drift_scale}  drift_decay={base_decay}  "
           f"vol_multiplier={args.vol_multiplier}  momentum_boost={args.momentum_boost}")
+    if args.dynamic_drift:
+        print(f"  mr_rate={args.mr_rate}  trend_strength={args.trend_strength}  vol_refit={args.vol_refit}")
 
     sim = USStockFutureSimulator(
         params=params_fwd,
@@ -1070,42 +1197,31 @@ def main():
     )
 
     model_tag = "+model" if _pm_pipelines is not None else ""
-    mode_tag  = (f"v11-{args.garch_model}(w={args.calib_window}){model_tag}"
-                 if args.auto_calibrate else "manual")
+    mode_tag  = (f"v12-{dyn_tag}-{args.garch_model}(w={args.calib_window}){model_tag}"
+                 if args.auto_calibrate else f"v12-{dyn_tag}-manual")
     out_path  = Path(args.output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     result_dict = {
-        "symbol":         args.symbol,
-        "end_date":       end_date_str,
-        "start_price":    start_price,
-        "forecast_steps": args.forecast,
-        "n_paths":        args.n_paths,
-        "mode":           mode_tag,
-        "params": {
-            "intra_bar":          args.intra_bar,
-            "momentum_boost":     args.momentum_boost,
-            "drift_decay":        base_decay,
-            "drift_decay_fast":   fast_decay,
-            "early_decay_bars":   early_bars,
-            "vol_multiplier":     args.vol_multiplier,
-            "drift_scale":        args.drift_scale,
-            "blend_drift":        round(blend_drift, 6),
-            "short_drift_weight": w,
-            "drift_clamp_max":    round(drift_clamp_max, 6) if drift_clamp_max else None,
-        },
-        "momentum_bias":      momentum_bias,
-        "momentum_reversed":  momentum_reversed,
-        "breakout_state":     breakout_state,
-        "auto_calibrate":     args.auto_calibrate,
-        "model_predicted":    model_predicted_params,
-        "sr_info":            sr_info,
-        "rep_path":           [round(float(x), 4) for x in rep_close],
+        "symbol":       args.symbol,
+        "end_date":     end_date_str,
+        "start_price":  round(start_price, 4),
+        "final_pred":   round(final_pred, 4),
+        "total_ret_pct": round(total_ret, 4),
+        "blend_drift":  round(blend_drift * 100, 5),
+        "mode":         mode_tag,
+        "dynamic_drift": args.dynamic_drift,
+        "mr_rate":      args.mr_rate,
+        "trend_strength": args.trend_strength,
+        "sr_info":      sr_info,
     }
+    if actual_close is not None and len(actual_close) > 0:
+        result_dict["actual_ret_pct"] = round(actual_ret, 4)
+        result_dict["mae_pct"]        = round(mae, 4)
 
     json_path = out_path / f"{args.symbol}_{end_date_str}_{mode_tag}.json"
-    with open(json_path, "w") as f:
-        json.dump(result_dict, f, indent=2, ensure_ascii=False)
+    with open(json_path, "w") as fj:
+        json.dump(result_dict, fj, indent=2, ensure_ascii=False)
     print(f"✔ 結果已儲存 → {json_path}")
 
     render_forecast(
@@ -1121,6 +1237,7 @@ def main():
         actual_close=actual_close,
         actual_ohlc=actual_ohlc,
         sr_info=sr_info,
+        drift_schedule=drift_schedule,
     )
 
 
