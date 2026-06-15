@@ -1,24 +1,19 @@
 """
-forward_study.py  v9  (GJR-GARCH + auto-calibrate)
+forward_study.py  v10  (GJR-GARCH + auto-calibrate + OHLC K線預測)
 
-v9 修正：
-  1. 傳送 median_path 到 render_forecast（修正 KeyError 'median_path'）
-  2. render_forecast 接收 median_path 參數
-  3. --param-model 旗標：joblib 載入的是 dict{models/feature_cols/targets}，
-     正確解開後逐 target 呼叫各自 Pipeline.predict()
-  4. 移除 auto-calibrate 區塊的重複 inline print
-  5. 移除 USStockFutureSimulator 不支援的參數：
-     shadow_noise_scale / shadow_clamp_sigma / body_scale_max
-  6. 改以「representative path」取代逐日中位數：
-     從 future_paths 中挑出與 pointwise-median MAE 最小的那一條，
-     保留每日隨機抖動，不再出現水平死線。
+v10 修正：
+  1. render_forecast 改用手繪 K 線（矩形 body + 上下影線）
+     直接取用 result.ohlcv_open/high/low/close（已由 USStockFutureSimulator._build_ohlcv 產生）
+  2. pick_representative_path 改成從 SimulationResult 直接讀 representative_path + ohlcv_*
+     不再重複計算；若 result.representative_path 是空 array 才 fallback 到舊邏輯
+  3. 歷史段維持折線，預測段改為逐根 K 線
 
 用法：
-  python scripts/forward_study.py \
-    --symbol AAPL \
-    --theta results/theta_aapl.json \
-    --auto-calibrate \
-    --param-model models/param_model_AAPL.joblib \
+  python scripts/forward_study.py \\
+    --symbol AAPL \\
+    --theta results/theta_aapl.json \\
+    --auto-calibrate \\
+    --param-model models/param_model_AAPL.joblib \\
     --end-date 2024-01-03
 """
 
@@ -35,6 +30,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import yfinance as yf
 
 warnings.filterwarnings("ignore")
@@ -93,15 +89,46 @@ def ensure_ohlcv(df):
     return df[["Open", "High", "Low", "Close", "Volume"]].dropna().reset_index()
 
 
-def pick_representative_path(paths: np.ndarray) -> np.ndarray:
+def pick_representative_path(result, paths_fallback: np.ndarray | None = None):
     """
-    從 paths (n_paths x T) 中挑出與逐日中位數 MAE 最小的那一條。
-    這條路徑保留了每日隨機抖動，又在統計上最「中間」。
+    優先從 SimulationResult.representative_path + ohlcv_* 取出代表路徑與 OHLC。
+    若 representative_path 是空 array，才 fallback 到舊邏輯（只有 close）。
+
+    回傳：
+        rep_close : np.ndarray  shape (T,)
+        ohlc      : dict  keys = open/high/low/close  shape (T,) each
+                    若 OHLC 不可用，ohlc = None
     """
-    pointwise_median = np.median(paths, axis=0)           # shape (T,)
-    maes = np.mean(np.abs(paths - pointwise_median), axis=1)  # shape (n_paths,)
+    rep = getattr(result, "representative_path", None)
+    if rep is not None and len(rep) > 0:
+        o = getattr(result, "ohlcv_open",  None)
+        h = getattr(result, "ohlcv_high",  None)
+        l = getattr(result, "ohlcv_low",   None)
+        c = getattr(result, "ohlcv_close", None)
+        if (o is not None and len(o) > 0 and
+                h is not None and len(h) > 0 and
+                l is not None and len(l) > 0 and
+                c is not None and len(c) > 0):
+            return np.asarray(rep), {
+                "open":  np.asarray(o),
+                "high":  np.asarray(h),
+                "low":   np.asarray(l),
+                "close": np.asarray(c),
+            }
+        return np.asarray(rep), None
+
+    # ── fallback: 舊邏輯（從 future_paths MAE 挑最近中位數那條） ──
+    paths = paths_fallback
+    if paths is None:
+        paths = getattr(result, "future_paths", None)
+    if paths is None or len(paths) == 0:
+        return np.array([]), None
+
+    paths = np.asarray(paths)
+    pointwise_median = np.median(paths, axis=0)
+    maes = np.mean(np.abs(paths - pointwise_median), axis=1)
     best_idx = int(np.argmin(maes))
-    return paths[best_idx]                                # shape (T,)
+    return paths[best_idx], None
 
 
 def parse_args():
@@ -184,7 +211,7 @@ def auto_calibrate(
 # ──────────────────────────────────────────────────────────────────────────────
 def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dict | None):
     print("\n" + "─" * 60)
-    print("  VERBOSE DIAGNOSTICS (v9 GJR-GARCH + auto-calibrate + param-model)")
+    print("  VERBOSE DIAGNOSTICS (v10 GJR-GARCH + auto-calibrate + param-model)")
     print("─" * 60)
     if calib_info:
         gi  = calib_info.get("_garch_info", {})
@@ -212,38 +239,105 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# render_forecast
+# 手繪 K 線
+# ──────────────────────────────────────────────────────────────────────────────
+def _draw_candles(ax, x_arr, o_arr, h_arr, l_arr, c_arr,
+                  width=0.6,
+                  bull_color="#26A69A", bear_color="#EF5350",
+                  alpha=0.9):
+    """
+    在 ax 上用 Matplotlib patches 手繪 K 線。
+    x_arr : x 座標（整數或浮點，逐根）
+    o/h/l/c : 各根 OHLC 陣列，長度與 x_arr 相同
+    """
+    for xi, o, h, l, c in zip(x_arr, o_arr, h_arr, l_arr, c_arr):
+        color  = bull_color if c >= o else bear_color
+        # ── 影線 ──
+        ax.plot([xi, xi], [l, h], color=color, lw=0.9, alpha=alpha, zorder=2)
+        # ── 實體 ──
+        body_y = min(o, c)
+        body_h = abs(c - o)
+        if body_h < 1e-8:          # 十字星：畫一條橫線
+            ax.plot([xi - width / 2, xi + width / 2],
+                    [c, c], color=color, lw=1.2, alpha=alpha, zorder=3)
+        else:
+            rect = mpatches.FancyBboxPatch(
+                (xi - width / 2, body_y), width, body_h,
+                boxstyle="square,pad=0",
+                linewidth=0.4,
+                edgecolor=color,
+                facecolor=color,
+                alpha=alpha,
+                zorder=3,
+            )
+            ax.add_patch(rect)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# render_forecast  v10 — 歷史折線 + 預測 K 線
 # ──────────────────────────────────────────────────────────────────────────────
 def render_forecast(
     symbol, hist_close, result, forecast, end_date_str,
-    output_dir, mode_tag, rep_path,
+    output_dir, mode_tag,
+    rep_close, ohlc,
     actual_close=None,
 ):
-    fig, ax = plt.subplots(figsize=(14, 6))
-    hist_x  = np.arange(-len(hist_close), 0)
-    ax.plot(hist_x, hist_close, color="#555555", lw=1.2, label="歷史收盤")
+    """
+    rep_close : np.ndarray  shape (≤forecast,)   代表路徑收盤
+    ohlc      : dict {open/high/low/close} 或 None
+    """
+    fig, ax = plt.subplots(figsize=(15, 6))
 
+    # ── 歷史折線 ──
+    hist_x = np.arange(-len(hist_close), 0)
+    ax.plot(hist_x, hist_close, color="#555555", lw=1.2, label="歷史收盤", zorder=4)
+
+    # ── 信心帶 ──
     fwd_x = np.arange(0, forecast)
-
     if hasattr(result, "p10") and result.p10 is not None:
         ax.fill_between(fwd_x, result.p10[:forecast], result.p90[:forecast],
-                        alpha=0.15, color="#2196F3", label="P10-P90")
+                        alpha=0.12, color="#2196F3", label="P10-P90")
         ax.fill_between(fwd_x, result.p25[:forecast], result.p75[:forecast],
-                        alpha=0.25, color="#2196F3", label="P25-P75")
+                        alpha=0.22, color="#2196F3", label="P25-P75")
 
-    rp = rep_path[:forecast]
-    ax.plot(fwd_x[:len(rp)], rp, color="#E53935", lw=1.8, label="代表路徑（最近P50）")
+    # ── 預測 K 線 ──
+    n = min(len(rep_close), forecast)
+    x_candle = np.arange(n)
 
+    if ohlc is not None:
+        o_arr = ohlc["open"][:n]
+        h_arr = ohlc["high"][:n]
+        l_arr = ohlc["low"][:n]
+        c_arr = ohlc["close"][:n]
+    else:
+        # OHLC 不可用：合成最簡版（open=prev_close, high/low 用±0.5%）
+        c_arr = rep_close[:n]
+        o_arr = np.concatenate([[hist_close[-1]], c_arr[:-1]])
+        spread = c_arr * 0.005
+        h_arr  = np.maximum(o_arr, c_arr) + spread
+        l_arr  = np.minimum(o_arr, c_arr) - spread
+
+    _draw_candles(ax, x_candle, o_arr, h_arr, l_arr, c_arr)
+
+    # 圖例用的假 patch
+    bull_patch = mpatches.Patch(color="#26A69A", label="預測漲K")
+    bear_patch = mpatches.Patch(color="#EF5350", label="預測跌K")
+
+    # ── 實際收盤（虛線） ──
     if actual_close is not None and len(actual_close) > 0:
-        n = min(len(actual_close), forecast)
-        ax.plot(fwd_x[:n], actual_close[:n],
-                color="#43A047", lw=1.5, ls="--", label="實際收盤")
+        na = min(len(actual_close), forecast)
+        ax.plot(fwd_x[:na], actual_close[:na],
+                color="#43A047", lw=1.5, ls="--", label="實際收盤", zorder=5)
 
     ax.axvline(0, color="#999999", lw=0.8, ls=":")
     ax.set_title(f"{symbol}  {end_date_str}  [{mode_tag}]")
     ax.set_xlabel("交易日（相對預測起點）")
-    ax.set_ylabel("收盤價")
-    ax.legend(loc="upper left", fontsize=8)
+    ax.set_ylabel("價格")
+
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles + [bull_patch, bear_patch],
+              labels  + ["預測漲K", "預測跌K"],
+              loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3)
 
     out   = Path(output_dir)
@@ -425,7 +519,7 @@ def main():
     if args.auto_calibrate:
         calib_window = args.calib_window
         model_label  = args.garch_model if use_garch else "rv"
-        print(f"\n[auto-calibrate v9] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
+        print(f"\n[auto-calibrate v10] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             df.iloc[:train_end_idx]["Close"].values.astype(float),
             theta,
@@ -528,35 +622,34 @@ def main():
     )
     result = sim.simulate()
 
-    # ── 代表路徑（最近 P50 的單條路徑，保留每日抖動） ──
-    if hasattr(result, "future_paths") and result.future_paths is not None:
-        future_paths = np.asarray(result.future_paths)  # (n_paths, T)
-        rep_path = pick_representative_path(future_paths)
-    elif hasattr(result, "median_path") and result.median_path is not None:
-        # fallback：若 SimulationResult 只有 median_path，直接用
-        rep_path = np.asarray(result.median_path)
-    else:
-        rep_path = np.full(args.forecast, start_price)
+    # ── 代表路徑 + OHLC ──
+    rep_close, ohlc = pick_representative_path(result)
 
-    rep_path = rep_path[:args.forecast]
+    if len(rep_close) == 0:
+        rep_close = np.full(args.forecast, start_price)
+        ohlc      = None
+
+    rep_close = rep_close[:args.forecast]
+    if ohlc is not None:
+        ohlc = {k: v[:args.forecast] for k, v in ohlc.items()}
 
     # ── summary ──
-    n          = len(rep_path)
-    final_pred = float(rep_path[n - 1])
+    n          = len(rep_close)
+    final_pred = float(rep_close[n - 1])
     total_ret  = (final_pred - start_price) / start_price * 100
     print(f"\n  起點價格 : {start_price:.2f}")
     print(f"  預測終點 : {final_pred:.2f}  ({total_ret:+.1f}%  {n}日)")
 
     if actual_close is not None and len(actual_close) > 0:
         na  = min(len(actual_close), n)
-        mae = float(np.mean(np.abs(actual_close[:na] - rep_path[:na]) / start_price * 100))
+        mae = float(np.mean(np.abs(actual_close[:na] - rep_close[:na]) / start_price * 100))
         actual_ret = (float(actual_close[na - 1]) - start_price) / start_price * 100
         print(f"  實際終點 : {actual_close[na-1]:.2f}  ({actual_ret:+.1f}%)")
         print(f"  MAE      : {mae:.2f}%")
 
-    # ── 儲存 ──
+    # ── 儲存 JSON ──
     model_tag = "+model" if _pm_pipelines is not None else ""
-    mode_tag  = (f"v9-{args.garch_model}(w={args.calib_window}){model_tag}"
+    mode_tag  = (f"v10-{args.garch_model}(w={args.calib_window}){model_tag}"
                  if args.auto_calibrate else "manual")
     out_path  = Path(args.output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -577,7 +670,7 @@ def main():
         },
         "auto_calibrate":  args.auto_calibrate,
         "model_predicted": model_predicted_params,
-        "rep_path":        [round(float(x), 4) for x in rep_path],
+        "rep_path":        [round(float(x), 4) for x in rep_close],
     }
 
     json_path = out_path / f"{args.symbol}_{end_date_str}_{mode_tag}.json"
@@ -593,7 +686,8 @@ def main():
         end_date_str=end_date_str,
         output_dir=args.output_dir,
         mode_tag=mode_tag,
-        rep_path=rep_path,
+        rep_close=rep_close,
+        ohlc=ohlc,
         actual_close=actual_close,
     )
     print(f"\n✔ 完成")
