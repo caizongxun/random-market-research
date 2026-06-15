@@ -3,13 +3,16 @@ run_pipeline.py  —  一鍵端到端流程
 
 流程步驟
 --------
-  Step 1  下載並快取 OHLCV → cache/{SYM}_ohlcv.parquet
+  Step 1  下載並快取 OHLCV + VIX + 10Y 殖利率
+          → cache/{SYM}_ohlcv.parquet
+          → cache/macro.parquet
   Step 2  校準 theta       → cache/{SYM}_theta.json
-  Step 3  動態 fear_threshold 分析（可選）
+  Step 3  校準代理人行為參數 → cache/{SYM}_agent_profile.json
+          （散戶動能強度、停損閾值、大戶回拉力等）
   Step 4  收集訓練資料     → cache/{SYM}_training_data.csv
   Step 5  訓練代理模型     → models/param_model_{SYM}.joblib
-  Step 6a Rolling Forward（baseline，純 auto_calibrate）
-  Step 6b Rolling Forward（+ param_model，加速版）
+  Step 6a Rolling Forward（baseline，純 auto_calibrate + medoid）
+  Step 6b Rolling Forward（+ param_model + agent_profile）
   Step 7  產生 HTML 對比報告 → results/pipeline/pipeline_report.html
 
 快取邏輯：每個中間結果有 --cache-hours（預設 23）的有效期，
@@ -66,7 +69,6 @@ RESULTS.mkdir(parents=True, exist_ok=True)
 # 工具函式
 # ──────────────────────────────────────────────────────────────
 def _age_hours(path: Path) -> float:
-    """回傳檔案距今幾小時，不存在回傳 inf。"""
     if not path.exists():
         return float("inf")
     mtime = path.stat().st_mtime
@@ -74,14 +76,12 @@ def _age_hours(path: Path) -> float:
 
 
 def _fresh(path: Path, cache_hours: float, force: bool) -> bool:
-    """True 表示快取有效（可跳過重算）。"""
     if force:
         return False
     return _age_hours(path) < cache_hours
 
 
 def _run(cmd: list[str], label: str) -> int:
-    """執行子程序，即時輸出，回傳 returncode。"""
     print(f"\n{'='*60}")
     print(f"  ▶  {label}")
     print(f"  CMD: {' '.join(cmd)}")
@@ -92,47 +92,114 @@ def _run(cmd: list[str], label: str) -> int:
     return ret
 
 
-def _banner(step: int, name: str):
+def _banner(step: int | str, name: str):
     print(f"\n{'#'*64}")
     print(f"#  Step {step}: {name}")
     print(f"{'#'*64}")
 
 
 # ──────────────────────────────────────────────────────────────
-# 個別步驟
+# Step 1：下載 OHLCV + Macro（VIX + 10Y 殖利率）
 # ──────────────────────────────────────────────────────────────
 def step1_download(sym: str, end_date: str | None, cache_hours: float, force: bool):
-    _banner(1, f"下載並快取 OHLCV  [{sym}]")
-    out = CACHE / f"{sym}_ohlcv.parquet"
-    if _fresh(out, cache_hours, force):
-        print(f"  [SKIP] 快取有效（{_age_hours(out):.1f} h < {cache_hours} h）→ {out}")
-        return str(out)
+    _banner(1, f"下載並快取 OHLCV + Macro  [{sym}]")
+    ohlcv_out = CACHE / f"{sym}_ohlcv.parquet"
+    macro_out  = CACHE / "macro.parquet"
 
-    # 用 Python 直接下載（避免額外腳本依賴）
-    try:
-        import yfinance as yf
-        import pandas as pd
-        end_dt   = pd.Timestamp(end_date) if end_date else pd.Timestamp.today()
-        start_dt = end_dt - pd.DateOffset(years=5)
-        dl_end   = end_dt + pd.DateOffset(days=120)
+    import pandas as pd
+    import yfinance as yf
 
-        df = yf.download(
-            sym,
-            start=start_dt.strftime("%Y-%m-%d"),
-            end=dl_end.strftime("%Y-%m-%d"),
-            interval="1d",
-            auto_adjust=False, progress=False,
-        )
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().reset_index()
-        df.to_parquet(out, index=False)
-        print(f"  ✔ 已儲存 {len(df)} 根 K 棒 → {out}")
-    except Exception as e:
-        print(f"  [ERROR] 下載失敗：{e}")
-    return str(out)
+    end_dt   = pd.Timestamp(end_date) if end_date else pd.Timestamp.today()
+    start_dt = end_dt - pd.DateOffset(years=5)
+    dl_end   = end_dt + pd.DateOffset(days=120)
+
+    # ── OHLCV ────────────────────────────────────────────────
+    if _fresh(ohlcv_out, cache_hours, force):
+        print(f"  [SKIP] OHLCV 快取有效（{_age_hours(ohlcv_out):.1f} h）→ {ohlcv_out}")
+    else:
+        try:
+            df = yf.download(
+                sym,
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=dl_end.strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=False, progress=False,
+            )
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().reset_index()
+            df.to_parquet(ohlcv_out, index=False)
+            print(f"  ✔ OHLCV {len(df)} 根 → {ohlcv_out}")
+        except Exception as e:
+            print(f"  [ERROR] OHLCV 下載失敗：{e}")
+
+    # ── Macro（VIX + 10Y）────────────────────────────────────
+    if _fresh(macro_out, cache_hours, force):
+        print(f"  [SKIP] Macro 快取有效（{_age_hours(macro_out):.1f} h）→ {macro_out}")
+    else:
+        try:
+            macro_frames = {}
+
+            # VIX（yfinance）
+            vix_raw = yf.download(
+                "^VIX",
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=dl_end.strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=False, progress=False,
+            )
+            if isinstance(vix_raw.columns, pd.MultiIndex):
+                vix_raw.columns = [c[0] for c in vix_raw.columns]
+            if len(vix_raw) > 0:
+                macro_frames["VIX"] = vix_raw["Close"].rename("VIX")
+                print(f"  ✔ VIX {len(vix_raw)} 根")
+            else:
+                print("  [WARN] VIX 無資料")
+
+            # 10Y 殖利率 — 優先 yfinance ^TNX，失敗時嘗試 pandas_datareader FRED
+            try:
+                tnx = yf.download(
+                    "^TNX",
+                    start=start_dt.strftime("%Y-%m-%d"),
+                    end=dl_end.strftime("%Y-%m-%d"),
+                    interval="1d",
+                    auto_adjust=False, progress=False,
+                )
+                if isinstance(tnx.columns, pd.MultiIndex):
+                    tnx.columns = [c[0] for c in tnx.columns]
+                if len(tnx) > 0:
+                    macro_frames["DGS10"] = tnx["Close"].rename("DGS10")
+                    print(f"  ✔ 10Y Yield (^TNX) {len(tnx)} 根")
+                else:
+                    raise ValueError("^TNX 無資料")
+            except Exception:
+                try:
+                    import pandas_datareader.data as web
+                    dgs10 = web.DataReader("DGS10", "fred",
+                                           start_dt.strftime("%Y-%m-%d"),
+                                           dl_end.strftime("%Y-%m-%d"))
+                    macro_frames["DGS10"] = dgs10["DGS10"].rename("DGS10")
+                    print(f"  ✔ 10Y Yield (FRED) {len(dgs10)} 根")
+                except Exception as e2:
+                    print(f"  [WARN] 10Y 殖利率無法取得：{e2}，跳過。")
+
+            if macro_frames:
+                macro_df = pd.concat(macro_frames.values(), axis=1)
+                macro_df.index = pd.to_datetime(macro_df.index)
+                macro_df = macro_df.sort_index().reset_index().rename(columns={"index": "Date"})
+                macro_df.to_parquet(macro_out, index=False)
+                print(f"  ✔ Macro ({list(macro_frames.keys())}) → {macro_out}")
+            else:
+                print("  [WARN] Macro 全部失敗，略過 macro.parquet")
+        except Exception as e:
+            print(f"  [ERROR] Macro 下載失敗：{e}")
+
+    return str(ohlcv_out)
 
 
+# ──────────────────────────────────────────────────────────────
+# Step 2：校準 theta
+# ──────────────────────────────────────────────────────────────
 def step2_calibrate(sym: str, end_date: str | None, cache_hours: float, force: bool):
     _banner(2, f"校準 theta  [{sym}]")
     out = CACHE / f"{sym}_theta.json"
@@ -152,6 +219,36 @@ def step2_calibrate(sym: str, end_date: str | None, cache_hours: float, force: b
     return str(out) if out.exists() else None
 
 
+# ──────────────────────────────────────────────────────────────
+# Step 3：校準代理人行為參數（取代舊 fear_threshold）
+# ──────────────────────────────────────────────────────────────
+def step3_agent_profile(sym: str, end_date: str | None, cache_hours: float, force: bool):
+    _banner(3, f"校準代理人行為參數  [{sym}]")
+    out = CACHE / f"{sym}_agent_profile.json"
+    if _fresh(out, cache_hours, force):
+        print(f"  [SKIP] 快取有效 → {out}")
+        return str(out)
+
+    script = SCRIPTS / "calibrate_agent_profile.py"
+    if not script.exists():
+        print(f"  [SKIP] 找不到 {script}")
+        return str(out) if out.exists() else None
+
+    # calibrate_agent_profile.py 輸出固定到 {cache_dir}/{SYM}_agent_profile.json
+    cmd = [
+        sys.executable, str(script),
+        "--symbol",    sym,
+        "--cache-dir", str(CACHE),
+    ]
+    if end_date:
+        cmd += ["--end-date", end_date]
+    _run(cmd, f"calibrate_agent_profile [{sym}]")
+    return str(out) if out.exists() else None
+
+
+# ──────────────────────────────────────────────────────────────
+# Step 4：收集訓練資料
+# ──────────────────────────────────────────────────────────────
 def step4_collect(sym: str, theta_path: str | None,
                   end_date: str | None, step: int,
                   cache_hours: float, force: bool):
@@ -177,6 +274,9 @@ def step4_collect(sym: str, theta_path: str | None,
     return str(out) if out.exists() else None
 
 
+# ──────────────────────────────────────────────────────────────
+# Step 5：訓練 surrogate
+# ──────────────────────────────────────────────────────────────
 def step5_train(sym: str, csv_path: str | None, cache_hours: float, force: bool):
     _banner(5, f"訓練代理模型  [{sym}]")
     out = MODELS / f"param_model_{sym}.joblib"
@@ -197,17 +297,24 @@ def step5_train(sym: str, csv_path: str | None, cache_hours: float, force: bool)
     return str(out) if out.exists() else None
 
 
+# ──────────────────────────────────────────────────────────────
+# Step 6：Rolling Forward
+# suffix 對照：
+#   baseline  → label_suffix = "medoid"       → JSON: {SYM}_{ed}_rolling{step}_medoid.json
+#   model     → label_suffix = "agent+medoid" → JSON: {SYM}_{ed}_rolling{step}_agent+medoid.json
+# ──────────────────────────────────────────────────────────────
 def step6_rolling(
     sym: str,
     theta_path: str | None,
     model_path: str | None,
+    agent_profile_path: str | None,
     end_date: str | None,
     total_bars: int,
     step: int,
     output_dir: str,
     use_model: bool,
 ):
-    label = f"Rolling Forward [{sym}]  {'+ param_model' if use_model else 'baseline'}"
+    label = f"Rolling Forward [{sym}]  {'+ param_model + agent' if use_model else 'baseline (medoid)'}"
     _banner("6b" if use_model else "6a", label)
 
     if theta_path is None or not Path(theta_path).exists():
@@ -228,16 +335,22 @@ def step6_rolling(
         cmd += ["--end-date", end_date]
     if use_model and model_path and Path(model_path).exists():
         cmd += ["--param-model", model_path]
+    if agent_profile_path and Path(agent_profile_path).exists():
+        cmd += ["--agent-profile", agent_profile_path]
 
     _run(cmd, label)
 
-    # 尋找產生的 JSON
+    # rolling_forward.py 的 label_suffix：
+    #   agent_profile 傳入時 = "agent+medoid"，否則 = "medoid"
     ed = end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    suffix = "_param-model" if use_model else ""
-    json_path = Path(output_dir) / f"{sym}_{ed}_rolling{step}{suffix}.json"
+    suffix = "agent+medoid" if (agent_profile_path and Path(agent_profile_path).exists()) else "medoid"
+    json_path = Path(output_dir) / f"{sym}_{ed}_rolling{step}_{suffix}.json"
     return str(json_path) if json_path.exists() else None
 
 
+# ──────────────────────────────────────────────────────────────
+# Step 7：HTML 報告（含覆蓋率欄位）
+# ──────────────────────────────────────────────────────────────
 def step7_report(
     sym_results: dict,   # {sym: {"baseline": json_path, "model": json_path}}
     output_dir: str,
@@ -262,31 +375,34 @@ def step7_report(
             v = d.get(key)
             return f"{v:{fmt}}" if v is not None else "N/A"
 
-        def _color(base_v, model_v):
-            """模型 MAE 比 baseline 小 → 綠，否則 → 紅。"""
+        def _color_lower(base_v, model_v):
+            """較小較好（MAE）：model < base → 綠。"""
             if base_v is None or model_v is None:
                 return ""
             return "color:#27ae60;font-weight:bold" if model_v < base_v else "color:#e74c3c;font-weight:bold"
 
-        b_mae  = base.get("overall_mae_pct")
-        m_mae  = modl.get("overall_mae_pct")
-        b_dir  = base.get("dir_accuracy_pct")
-        m_dir  = modl.get("dir_accuracy_pct")
+        def _color_higher(base_v, model_v):
+            """較大較好（Dir%, Coverage）：model > base → 綠。"""
+            if base_v is None or model_v is None:
+                return ""
+            return "color:#27ae60;font-weight:bold" if model_v > base_v else "color:#e74c3c;font-weight:bold"
 
-        mae_style = _color(b_mae, m_mae)
-        # 方向命中：模型高 → 綠
-        dir_style = _color(
-            100 - b_dir if b_dir is not None else None,
-            100 - m_dir if m_dir is not None else None,
-        )
+        b_mae = base.get("overall_mae_pct")
+        m_mae = modl.get("overall_mae_pct")
+        b_dir = base.get("dir_accuracy_pct")
+        m_dir = modl.get("dir_accuracy_pct")
+        b_cov = base.get("coverage_p10_p90")
+        m_cov = modl.get("coverage_p10_p90")
 
         rows_html += f"""
         <tr>
           <td><b>{sym}</b></td>
           <td>{_fmt(base, 'overall_mae_pct')}%</td>
-          <td style="{mae_style}">{_fmt(modl, 'overall_mae_pct')}%</td>
+          <td style="{_color_lower(b_mae, m_mae)}">{_fmt(modl, 'overall_mae_pct')}%</td>
           <td>{_fmt(base, 'dir_accuracy_pct')}%</td>
-          <td style="{dir_style}">{_fmt(modl, 'dir_accuracy_pct')}%</td>
+          <td style="{_color_higher(b_dir, m_dir)}">{_fmt(modl, 'dir_accuracy_pct')}%</td>
+          <td>{_fmt(base, 'coverage_p10_p90')}%</td>
+          <td style="{_color_higher(b_cov, m_cov)}">{_fmt(modl, 'coverage_p10_p90')}%</td>
           <td>{base.get('total_bars', 'N/A')}</td>
           <td>{base.get('step', 'N/A')}</td>
         </tr>"""
@@ -312,7 +428,7 @@ def step7_report(
 </style>
 </head>
 <body>
-<h1>📊 Pipeline Report</h1>
+<h1>Pipeline Report</h1>
 <div class="meta">生成時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
 <table>
   <thead>
@@ -322,6 +438,8 @@ def step7_report(
       <th>Model MAE%</th>
       <th>Baseline Dir%</th>
       <th>Model Dir%</th>
+      <th>Baseline Cov%</th>
+      <th>Model Cov%</th>
       <th>Total Bars</th>
       <th>Step</th>
     </tr>
@@ -331,8 +449,9 @@ def step7_report(
   </tbody>
 </table>
 <div class="legend">
-  <span class="green">■ 綠色</span>：Model 優於 Baseline　
-  <span class="red">■ 紅色</span>：Model 劣於 Baseline
+  <span class="green">■ 綠色</span>：Model 優於 Baseline&nbsp;&nbsp;
+  <span class="red">■ 紅色</span>：Model 劣於 Baseline&nbsp;&nbsp;
+  Cov% = P10–P90 覆蓋率（目標 ≥ 80%）
 </div>
 </body>
 </html>"""
@@ -349,19 +468,19 @@ def step7_report(
 # ──────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(description="End-to-end pipeline")
-    p.add_argument("--symbol",       nargs="+", required=True, help="股票代號，可多個")
-    p.add_argument("--end-date",     default=None,  help="預測起點截止日 YYYY-MM-DD")
-    p.add_argument("--total-bars",   type=int, default=30)
-    p.add_argument("--step",         type=int, default=5)
-    p.add_argument("--cache-hours",  type=float, default=23.0,
+    p.add_argument("--symbol",        nargs="+", required=True, help="股票代號，可多個")
+    p.add_argument("--end-date",      default=None,  help="預測起點截止日 YYYY-MM-DD")
+    p.add_argument("--total-bars",    type=int, default=30)
+    p.add_argument("--step",          type=int, default=5)
+    p.add_argument("--cache-hours",   type=float, default=23.0,
                    help="快取有效時間（小時），預設 23")
-    p.add_argument("--force-refresh",action="store_true",
+    p.add_argument("--force-refresh", action="store_true",
                    help="忽略快取，全部重跑")
-    p.add_argument("--skip-steps",   nargs="+", type=int, default=[],
+    p.add_argument("--skip-steps",    nargs="+", type=int, default=[],
                    help="跳過指定步驟編號，如 --skip-steps 1 2 3")
-    p.add_argument("--stop-after",   type=int, default=7,
+    p.add_argument("--stop-after",    type=int, default=7,
                    help="跑完哪一步後停止（預設 7 = 全部）")
-    p.add_argument("--output-dir",   default=str(RESULTS))
+    p.add_argument("--output-dir",    default=str(RESULTS))
     return p.parse_args()
 
 
@@ -378,9 +497,10 @@ def main():
         print(f"*  處理股票：{sym}")
         print(f"{'*'*64}")
 
-        theta_path = None
-        csv_path   = None
-        model_path = None
+        theta_path        = None
+        agent_profile_path = None
+        csv_path          = None
+        model_path        = None
 
         # Step 1
         if 1 not in skip and stop >= 1:
@@ -390,28 +510,17 @@ def main():
         if 2 not in skip and stop >= 2:
             theta_path = step2_calibrate(sym, args.end_date, args.cache_hours, args.force_refresh)
         else:
-            # 嘗試從快取讀取
             candidate = CACHE / f"{sym}_theta.json"
             theta_path = str(candidate) if candidate.exists() else None
 
-        # Step 3：fear_threshold 分析（可選，若腳本存在才執行）
+        # Step 3：代理人行為校準（新版，取代 fear_threshold）
         if 3 not in skip and stop >= 3:
-            ft_script = SCRIPTS / "analyze_fear_threshold.py"
-            if ft_script.exists() and theta_path and Path(theta_path).exists():
-                _banner(3, f"Fear Threshold 分析  [{sym}]")
-                ft_out = CACHE / f"{sym}_fear_profile.json"
-                if not _fresh(ft_out, args.cache_hours, args.force_refresh):
-                    cmd = [
-                        sys.executable, str(ft_script),
-                        "--symbol", sym,
-                        "--theta",  theta_path,
-                        "--output", str(ft_out),
-                    ]
-                    if args.end_date:
-                        cmd += ["--end-date", args.end_date]
-                    _run(cmd, f"analyze_fear_threshold [{sym}]")
-                else:
-                    print(f"  [SKIP] Fear profile 快取有效 → {ft_out}")
+            agent_profile_path = step3_agent_profile(
+                sym, args.end_date, args.cache_hours, args.force_refresh
+            )
+        else:
+            candidate = CACHE / f"{sym}_agent_profile.json"
+            agent_profile_path = str(candidate) if candidate.exists() else None
 
         # Step 4
         if 4 not in skip and stop >= 4:
@@ -433,18 +542,18 @@ def main():
         base_json  = None
         model_json = None
 
-        # Step 6a  baseline
+        # Step 6a：baseline（medoid，無 param_model / agent_profile）
         if 6 not in skip and stop >= 6:
             base_json = step6_rolling(
-                sym, theta_path, None,
+                sym, theta_path, None, None,
                 args.end_date, args.total_bars, args.step,
                 args.output_dir, use_model=False,
             )
 
-        # Step 6b  param-model
+        # Step 6b：model + agent（medoid + param_model + agent_profile）
         if 6 not in skip and stop >= 6:
             model_json = step6_rolling(
-                sym, theta_path, model_path,
+                sym, theta_path, model_path, agent_profile_path,
                 args.end_date, args.total_bars, args.step,
                 args.output_dir, use_model=True,
             )
