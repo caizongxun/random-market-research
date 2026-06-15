@@ -1,7 +1,14 @@
 """
-forward_study.py  v11.5  (GJR-GARCH + auto-calibrate + OHLC K線預測)
+forward_study.py  v11.6  (GJR-GARCH + auto-calibrate + OHLC K線預測)
 
-v11.5 新增：
+v11.6 修正：
+  支撐/壓力語義修正
+  - pivot_low（前期低點）只能被選為支撐（低於現價）
+  - pivot_high（前期高點）只能被選為壓力（高於現價）
+  - histogram 密集帶：仍依「低於起點 = 支撐，高於起點 = 壓力」分配（無語義限制）
+  - 修正前：兩組極值點全進合併池，導致前期高點被誤分為支撐（反之亦然）
+
+v11.5 已有：
   支撐/壓力偵測 — 雙軌合併法
   - 方法一：價格密度直方圖（保留）找成交密集帶
   - 方法二：局部低點/高點聚集（新增）找前期 swing low/high
@@ -181,36 +188,43 @@ def compute_sr_drift_adjustment(
     max_resist_push: float = 0.0003,   # 最大空頭修正 -0.03%/day
 ):
     """
-    雙軌合併：
-      1. 直方圖密集帶（方法一）
-      2. 局部 swing low/high 聚集（方法二）
+    雙軌合併（v11.6 語義修正版）：
+      1. 直方圖密集帶（方法一）：低於起點 → 支撐候選；高於起點 → 壓力候選
+      2. pivot_low（前期低點）：只能作為支撐候選（必須低於起點）
+         pivot_high（前期高點）：只能作為壓力候選（必須高於起點）
+
     合併後分別取最近支撐與最近壓力，套用線性插值修正 blend_drift。
     回傳 (drift_adj, sr_info_dict)
     """
-    # 方法一：直方圖
+    # 方法一：直方圖（無語義限制，依位置分配）
     hist_levels = find_support_resistance(
         close_arr, window=sr_window, n_bins=n_bins, top_k=top_k
     )
+    hist_supports    = [(lv, src) for lv, src in hist_levels if lv < start_price]
+    hist_resistances = [(lv, src) for lv, src in hist_levels if lv > start_price]
 
-    # 方法二：局部低/高點
+    # 方法二：pivot — 語義嚴格分配
     pivot_lows, pivot_highs = find_local_extrema(
         close_arr, window=sr_window, order=pivot_order,
         cluster_pct=pivot_cluster_pct,
     )
+    # pivot_low 只做支撐（必須低於起點）
+    pivot_supports    = [(lv, src) for lv, src in pivot_lows  if lv < start_price]
+    # pivot_high 只做壓力（必須高於起點）
+    pivot_resistances = [(lv, src) for lv, src in pivot_highs if lv > start_price]
 
-    # 合併所有水平線；支撐 = 低於起點，壓力 = 高於起點
-    all_levels = hist_levels + pivot_lows + pivot_highs
-    supports    = [(lv, src) for lv, src in all_levels if lv < start_price]
-    resistances = [(lv, src) for lv, src in all_levels if lv > start_price]
+    # 合併各自候選池
+    supports    = hist_supports    + pivot_supports
+    resistances = hist_resistances + pivot_resistances
 
     # 取最近的支撐/壓力
     nearest_support_tuple  = max(supports,    key=lambda x: x[0]) if supports    else None
     nearest_resist_tuple   = min(resistances, key=lambda x: x[0]) if resistances else None
 
-    nearest_support  = nearest_support_tuple[0]  if nearest_support_tuple  else None
-    nearest_support_src = nearest_support_tuple[1] if nearest_support_tuple else None
-    nearest_resist   = nearest_resist_tuple[0]   if nearest_resist_tuple   else None
-    nearest_resist_src  = nearest_resist_tuple[1]  if nearest_resist_tuple  else None
+    nearest_support      = nearest_support_tuple[0]  if nearest_support_tuple  else None
+    nearest_support_src  = nearest_support_tuple[1]  if nearest_support_tuple  else None
+    nearest_resist       = nearest_resist_tuple[0]   if nearest_resist_tuple   else None
+    nearest_resist_src   = nearest_resist_tuple[1]   if nearest_resist_tuple   else None
 
     drift_adj    = 0.0
     support_pull = 0.0
@@ -396,7 +410,7 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
                       momentum_reversed: bool = False,
                       sr_info: dict | None = None):
     print("\n" + "─" * 60)
-    print("  VERBOSE DIAGNOSTICS (v11.5)")
+    print("  VERBOSE DIAGNOSTICS (v11.6)")
     print("─" * 60)
     if calib_info:
         gi  = calib_info.get("_garch_info", {})
@@ -430,7 +444,7 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
     # ── 支撐壓力區塊 ──
     if sr_info is not None:
         zone_pct = sr_info.get("zone_pct", 0.035)
-        print(f"\n  [支撐壓力]  門檻={zone_pct*100:.1f}%  (直方圖 + 局部低/高點合併)")
+        print(f"\n  [支撐壓力]  門檻={zone_pct*100:.1f}%  (直方圖 + pivot_low/pivot_high 語義分配)")
         ns    = sr_info.get("near_support")
         ns_src= sr_info.get("near_support_src", "")
         nr    = sr_info.get("near_resist")
@@ -443,13 +457,13 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
             pull_str = f"→ drift +{sp*100:.4f}%/day" if sp > 0 else f"(距離 > {zone_pct*100:.1f}%，無修正)"
             print(f"  near_support  : {ns:.2f}  [{ns_src}]  (距起點 -{dist_s*100:.2f}%)  {pull_str}")
         else:
-            print(f"  near_support  : 無（近期無低於起點的支撐水平）")
+            print(f"  near_support  : 無（近期無符合語義的支撐水平）")
         if nr is not None:
             dist_r = sr_info.get("dist_resist", 0.0)
             push_str = f"→ drift -{rp*100:.4f}%/day" if rp > 0 else f"(距離 > {zone_pct*100:.1f}%，無修正)"
             print(f"  near_resist   : {nr:.2f}  [{nr_src}]  (距起點 +{dist_r*100:.2f}%)  {push_str}")
         else:
-            print(f"  near_resist   : 無（近期無高於起點的壓力水平）")
+            print(f"  near_resist   : 無（近期無符合語義的壓力水平）")
         if abs(da) > 1e-9:
             print(f"  ✅ SR drift 修正 : {da*100:+.4f}%/day  (已加入 blend_drift)")
         else:
@@ -845,7 +859,7 @@ def main():
     if args.auto_calibrate:
         calib_window = args.calib_window
         model_label  = args.garch_model if use_garch else "rv"
-        print(f"\n[auto-calibrate v11.5] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
+        print(f"\n[auto-calibrate v11.6] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             df.iloc[:train_end_idx]["Close"].values.astype(float),
             theta,
@@ -911,7 +925,7 @@ def main():
             print(f"  [drift clamp] {blend_drift_raw*100:+.4f}%/day → {blend_drift*100:+.4f}%/day  "
                   f"(MAX=±{drift_clamp_max*100:.4f}%/day)")
 
-    # ── v11.5：支撐壓力修正 blend_drift（雙軌合併，門檻 3.5%）──
+    # ── v11.6：支撐壓力修正 blend_drift（pivot 語義修正版）──
     sr_info: dict | None = None
     if not args.no_sr:
         sr_close_arr = df.iloc[:train_end_idx]["Close"].values.astype(float)
