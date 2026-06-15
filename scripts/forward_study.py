@@ -1,23 +1,25 @@
 """
-forward_study.py  v11  (GJR-GARCH + auto-calibrate + OHLC K線預測)
+forward_study.py  v11.1  (GJR-GARCH + auto-calibrate + OHLC K線預測)
 
-v11 修正（貼近實際走勢）：
-  1. 保留 estimator 算出的 momentum_bias + node_breakout_state
-     不再強制歸零 → 讓預測起點的短期動能（含空頭偏壓）自然傳入模擬器
-  2. backbone drift 改為「短期 5 日 drift × 0.4 + 長期 last_drift × 0.6」混合
-     起初期路徑能反映近期趨勢轉折（如急跌），而非硬貼長期上升斜率
+v11.1 新增：
+  1. print_ohlc_comparison() — 每根 K 棒對照表，印出預測 OHLC vs 實際 OHLC
+     方便直接比對哪段有偶差、哪段方向對、哪段波動率偏差
+  2. 修正實際收盤線消失問題：將 future_df 的實際 OHLC 一並傳入 render_forecast
+
+v11 已有：
+  1. 保留 momentum_bias + node_breakout_state
+  2. backbone drift = 0.4 × short_drift(5d) + 0.6 × last_drift
 
 v10 已有：
-  1. render_forecast 改用手繪 K 線（矩形 body + 上下影線）
-  2. pick_representative_path 從 SimulationResult 直接讀 representative_path + ohlcv_*
-  3. 歷史段維持折線，預測段改為逐根 K 線
+  1. render_forecast 手繪 K 線
+  2. pick_representative_path 從 SimulationResult 直接讀 OHLC
 
 用法：
   python scripts/forward_study.py \\
     --symbol AAPL \\
     --theta results/theta_aapl.json \\
     --auto-calibrate \\
-    --end-date 2024-01-03
+    --verbose
 """
 
 from __future__ import annotations
@@ -95,12 +97,7 @@ def ensure_ohlcv(df):
 def pick_representative_path(result, paths_fallback: np.ndarray | None = None):
     """
     優先從 SimulationResult.representative_path + ohlcv_* 取出代表路徑與 OHLC。
-    若 representative_path 是空 array，才 fallback 到舊邏輯（只有 close）。
-
-    回傳：
-        rep_close : np.ndarray  shape (T,)
-        ohlc      : dict  keys = open/high/low/close  shape (T,) each
-                    若 OHLC 不可用，ohlc = None
+    若 representative_path 是空 array，才 fallback 到舊邏輯。
     """
     rep = getattr(result, "representative_path", None)
     if rep is not None and len(rep) > 0:
@@ -120,7 +117,6 @@ def pick_representative_path(result, paths_fallback: np.ndarray | None = None):
             }
         return np.asarray(rep), None
 
-    # ── fallback: 舊邏輯（從 future_paths MAE 挑最近中位數那條） ──
     paths = paths_fallback
     if paths is None:
         paths = getattr(result, "future_paths", None)
@@ -158,9 +154,8 @@ def parse_args():
     p.add_argument("--param-model",    default=None)
     p.add_argument("--output-dir",     default="results")
     p.add_argument("--verbose",         action="store_true")
-    # v11: short-drift blend weight (預設 0.4)
     p.add_argument("--short-drift-weight", type=float, default=0.4,
-                   help="近期 5 日 drift 在 backbone 混合中的權重 (0~1，預設 0.4)")
+                   help="近期 5 日 drift 在 backbone 混合中的權重 (0~1)")
     return p.parse_args()
 
 
@@ -220,7 +215,7 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
                       blend_drift: float = 0.0, short_drift: float = 0.0,
                       last_drift: float = 0.0):
     print("\n" + "─" * 60)
-    print("  VERBOSE DIAGNOSTICS (v11 GJR-GARCH + momentum_bias + blend drift)")
+    print("  VERBOSE DIAGNOSTICS (v11.1)")
     print("─" * 60)
     if calib_info:
         gi  = calib_info.get("_garch_info", {})
@@ -256,6 +251,92 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# print_ohlc_comparison  — 預測 vs 實際 OHLC 每棒對照表
+# ──────────────────────────────────────────────────────────────────────────────
+def print_ohlc_comparison(
+    pred_ohlc: dict | None,
+    pred_close: np.ndarray,
+    actual_df: pd.DataFrame | None,
+    start_price: float,
+    symbol: str,
+):
+    """
+    逐根印出預測 OHLC vs 實際 OHLC。
+    actual_df 應包含 Open / High / Low / Close 欄位。
+    """
+    n = len(pred_close)
+    has_actual = actual_df is not None and len(actual_df) >= 1
+    has_pred_ohlc = pred_ohlc is not None
+
+    sep = "─" * 100
+    print(f"\n{sep}")
+    print(f"  OHLC 對照表 — {symbol}  (共 {n} 根 K 棒)")
+    print(sep)
+
+    hdr = (f"  {'Bar':>3}  "
+           f"{'P-Open':>8} {'P-High':>8} {'P-Low':>8} {'P-Close':>8} {'P-Ret%':>7}  "
+           f"{'A-Open':>8} {'A-High':>8} {'A-Low':>8} {'A-Close':>8} {'A-Ret%':>7}  "
+           f"{'ClsErr%':>8} {'Dir':>4}")
+    print(hdr)
+    print("─" * 100)
+
+    prev_pred_c  = start_price
+    prev_act_c   = start_price
+    cum_pred_ret = 0.0
+    cum_act_ret  = 0.0
+
+    close_errs = []
+
+    for i in range(n):
+        p_c = float(pred_close[i])
+        p_o = float(pred_ohlc["open"][i])  if has_pred_ohlc else float(pred_close[i - 1] if i > 0 else start_price)
+        p_h = float(pred_ohlc["high"][i])  if has_pred_ohlc else p_c * 1.005
+        p_l = float(pred_ohlc["low"][i])   if has_pred_ohlc else p_c * 0.995
+
+        p_ret = (p_c - prev_pred_c) / prev_pred_c * 100
+
+        if has_actual and i < len(actual_df):
+            row   = actual_df.iloc[i]
+            a_o   = float(row.get("Open",  row.get("open",  p_o)))
+            a_h   = float(row.get("High",  row.get("high",  p_h)))
+            a_l   = float(row.get("Low",   row.get("low",   p_l)))
+            a_c   = float(row.get("Close", row.get("close", p_c)))
+            a_ret = (a_c - prev_act_c) / prev_act_c * 100
+
+            cls_err = (p_c - a_c) / a_c * 100
+            close_errs.append(abs(cls_err))
+
+            # 方向對还是反？
+            p_dir = "+" if p_c >= prev_pred_c else "-"
+            a_dir = "+" if a_c >= prev_act_c  else "-"
+            dir_match = "✓" if p_dir == a_dir else "✗"
+
+            print(f"  {i+1:>3}  "
+                  f"{p_o:>8.2f} {p_h:>8.2f} {p_l:>8.2f} {p_c:>8.2f} {p_ret:>+7.2f}%  "
+                  f"{a_o:>8.2f} {a_h:>8.2f} {a_l:>8.2f} {a_c:>8.2f} {a_ret:>+7.2f}%  "
+                  f"{cls_err:>+8.2f}% {dir_match:>4}")
+
+            prev_act_c  = a_c
+            cum_act_ret = (a_c - start_price) / start_price * 100
+        else:
+            print(f"  {i+1:>3}  "
+                  f"{p_o:>8.2f} {p_h:>8.2f} {p_l:>8.2f} {p_c:>8.2f} {p_ret:>+7.2f}%  "
+                  f"{'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>8} {'N/A':>7}  "
+                  f"{'N/A':>8} {'N/A':>4}")
+
+        prev_pred_c = p_c
+        cum_pred_ret = (p_c - start_price) / start_price * 100
+
+    print("─" * 100)
+    print(f"  累計預測: {cum_pred_ret:+.2f}%   "
+          + (f"累計實際: {cum_act_ret:+.2f}%   "
+             f"MAE(close): {float(np.mean(close_errs)):.2f}%   "
+             f"MAX(close): {float(np.max(close_errs)):.2f}%"
+             if close_errs else "實際數據不足，無法計算"))
+    print(sep + "\n")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 手繪 K 線
 # ──────────────────────────────────────────────────────────────────────────────
 def _draw_candles(ax, x_arr, o_arr, h_arr, l_arr, c_arr,
@@ -284,13 +365,14 @@ def _draw_candles(ax, x_arr, o_arr, h_arr, l_arr, c_arr,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# render_forecast  v11 — 歷史折線 + 預測 K 線
+# render_forecast
 # ──────────────────────────────────────────────────────────────────────────────
 def render_forecast(
     symbol, hist_close, result, forecast, end_date_str,
     output_dir, mode_tag,
     rep_close, ohlc,
     actual_close=None,
+    actual_ohlc: dict | None = None,
 ):
     fig, ax = plt.subplots(figsize=(15, 6))
 
@@ -324,9 +406,16 @@ def render_forecast(
     bull_patch = mpatches.Patch(color="#26A69A", label="預測漲K")
     bear_patch = mpatches.Patch(color="#EF5350", label="預測跌K")
 
-    if actual_close is not None and len(actual_close) > 0:
-        na = min(len(actual_close), forecast)
-        ax.plot(fwd_x[:na], actual_close[:na],
+    # 實際走勢 — 優先用實際 OHLC 的 close，其次用 actual_close
+    _actual_c = None
+    if actual_ohlc is not None and "close" in actual_ohlc:
+        _actual_c = np.asarray(actual_ohlc["close"])
+    elif actual_close is not None:
+        _actual_c = np.asarray(actual_close)
+
+    if _actual_c is not None and len(_actual_c) > 0:
+        na = min(len(_actual_c), forecast)
+        ax.plot(fwd_x[:na], _actual_c[:na],
                 color="#43A047", lw=1.5, ls="--", label="實際收盤", zorder=5)
 
     ax.axvline(0, color="#999999", lw=0.8, ls=":")
@@ -450,7 +539,6 @@ def main():
     with open(args.theta) as f:
         theta = CalibratedTheta.from_dict(json.load(f))
 
-    # ── 載入 param-model ──
     _pm_pipelines    = None
     _pm_feat_cols    = []
     _pm_target_names = []
@@ -505,10 +593,21 @@ def main():
     train_end_idx = int(mask.values.nonzero()[0][-1]) + 1
 
     train_df  = df.iloc[train_end_idx - args.lookback: train_end_idx]
-    future_df = df.iloc[train_end_idx: train_end_idx + args.forecast]
+    future_df = df.iloc[train_end_idx: train_end_idx + args.forecast].copy()
 
     close_hist   = train_df["Close"].values.astype(float)
     actual_close = future_df["Close"].values.astype(float) if len(future_df) > 0 else None
+
+    # 實際 OHLC dict — 用於對照表和圖表
+    actual_ohlc: dict | None = None
+    if len(future_df) > 0:
+        actual_ohlc = {
+            "open":  future_df["Open"].values.astype(float),
+            "high":  future_df["High"].values.astype(float),
+            "low":   future_df["Low"].values.astype(float),
+            "close": future_df["Close"].values.astype(float),
+        }
+
     start_price  = float(close_hist[-1])
 
     # ── auto-calibrate ──
@@ -519,7 +618,7 @@ def main():
     if args.auto_calibrate:
         calib_window = args.calib_window
         model_label  = args.garch_model if use_garch else "rv"
-        print(f"\n[auto-calibrate v11] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
+        print(f"\n[auto-calibrate v11.1] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             df.iloc[:train_end_idx]["Close"].values.astype(float),
             theta,
@@ -546,8 +645,8 @@ def main():
 
     # ── param-model 覆蓋 ──
     if _pm_pipelines is not None:
-        feat_df  = df.iloc[train_end_idx - args.calib_window: train_end_idx]
-        feats    = extract_features_for_model(feat_df, theta.vol)
+        feat_df   = df.iloc[train_end_idx - args.calib_window: train_end_idx]
+        feats     = extract_features_for_model(feat_df, theta.vol)
         feat_cols = _pm_feat_cols if _pm_feat_cols else list(feats.keys())
         feat_vec  = np.array([[feats.get(k, 0.0) for k in feat_cols]])
 
@@ -564,7 +663,6 @@ def main():
         print(f"[param-model] 預測參數: {model_predicted_params}")
 
     # ── backbone ──
-    # v11: 混合近期 5 日 drift 與 backbone 長期 drift
     fitter     = BackboneFitter(n_seg=6, smooth_reg=0.5)
     bb_result  = fitter.fit(close_hist)
     last_drift = float(bb_result.segment_drifts[-1])
@@ -590,13 +688,10 @@ def main():
     base_params = estimator.fit(estimate_df, symbol=args.symbol)
     params_fwd  = build_params_from_theta(theta, base_params)
 
-    # v11: 保留 estimator 算出的 momentum_bias 與 node_breakout_state
-    #      只更新 last_close，不再強制歸零動能狀態
     import dataclasses
     params_fwd = dataclasses.replace(
         params_fwd,
         last_close=start_price,
-        # momentum_bias 與 node_breakout_state 保持 estimator 原值
     )
     momentum_bias   = float(getattr(params_fwd, "momentum_bias",       0.0))
     breakout_state  = int(getattr(params_fwd,   "node_breakout_state", 0))
@@ -667,6 +762,15 @@ def main():
         print(f"  實際終點 : {actual_close[na-1]:.2f}  ({actual_ret:+.1f}%)")
         print(f"  MAE      : {mae:.2f}%")
 
+    # ── OHLC 對照表（每根 K 棒明細）──
+    print_ohlc_comparison(
+        pred_ohlc=ohlc,
+        pred_close=rep_close,
+        actual_df=future_df.reset_index(drop=True) if len(future_df) > 0 else None,
+        start_price=start_price,
+        symbol=args.symbol,
+    )
+
     # ── 儲存 JSON ──
     model_tag = "+model" if _pm_pipelines is not None else ""
     mode_tag  = (f"v11-{args.garch_model}(w={args.calib_window}){model_tag}"
@@ -682,12 +786,12 @@ def main():
         "n_paths":        args.n_paths,
         "mode":           mode_tag,
         "params": {
-            "intra_bar":         args.intra_bar,
-            "momentum_boost":    args.momentum_boost,
-            "drift_decay":       args.drift_decay,
-            "vol_multiplier":    args.vol_multiplier,
-            "drift_scale":       args.drift_scale,
-            "blend_drift":       round(blend_drift, 6),
+            "intra_bar":          args.intra_bar,
+            "momentum_boost":     args.momentum_boost,
+            "drift_decay":        args.drift_decay,
+            "vol_multiplier":     args.vol_multiplier,
+            "drift_scale":        args.drift_scale,
+            "blend_drift":        round(blend_drift, 6),
             "short_drift_weight": w,
         },
         "momentum_bias":    momentum_bias,
@@ -700,7 +804,7 @@ def main():
     json_path = out_path / f"{args.symbol}_{end_date_str}_{mode_tag}.json"
     with open(json_path, "w") as f:
         json.dump(result_dict, f, indent=2)
-    print(f"\n✔ JSON 已儲存 → {json_path}")
+    print(f"✔ JSON 已儲存 → {json_path}")
 
     render_forecast(
         symbol=args.symbol,
@@ -713,8 +817,9 @@ def main():
         rep_close=rep_close,
         ohlc=ohlc,
         actual_close=actual_close,
+        actual_ohlc=actual_ohlc,
     )
-    print(f"\n✔ 完成")
+    print(f"✔ 完成")
 
 
 if __name__ == "__main__":
