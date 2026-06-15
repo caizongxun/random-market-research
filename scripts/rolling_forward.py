@@ -1,5 +1,5 @@
 """
-rolling_forward.py  (v3.1 - Medoid + P10/P90 + Coverage + Agent Layer + VIX hookup)
+rolling_forward.py  (v3.2 - feature set v2 sync)
 
 核心流程
 --------
@@ -30,6 +30,12 @@ rolling_forward.py  (v3.1 - Medoid + P10/P90 + Coverage + Agent Layer + VIX hook
 - Bug fix: _load_vix_series 讀到 tz-aware DatetimeIndex 時
   _get_vix_at 的 <= 比較會拋 TypeError。
   現在統一 tz_localize(None) 去除時區，cutoff_date 也同步去除時區。
+
+特徵同步（v3.2）
+---------------
+- _extract_features 與 collect_training_data.py v2 完全同步，
+  新增 12 個市場微觀結構特徵（Group A/B/C），確保 surrogate
+  推論時特徵與訓練時一致。
 
 方向命中定義（v2）
 ------------------
@@ -94,13 +100,6 @@ except ImportError:
 # VIX 查詢輔助（v3 新增；v3.1 修復 tz-aware index 問題）
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_vix_series(cache_dir: str | None = None) -> pd.Series | None:
-    """
-    從 cache/macro.parquet 讀取 VIX 序列。
-    回傳 pd.Series(index=DatetimeIndex[tz-naive], values=float) 或 None。
-
-    v3.1: 統一去除 index 時區（tz_localize(None) 或 tz_convert(None)），
-    避免後續與 tz-naive Timestamp 比較時拋 TypeError。
-    """
     if cache_dir is None:
         cache_dir = str(Path(__file__).parent.parent / "cache")
     macro_path = Path(cache_dir) / "macro.parquet"
@@ -112,7 +111,6 @@ def _load_vix_series(cache_dir: str | None = None) -> pd.Series | None:
             if col in df.columns:
                 s = df[col].dropna()
                 idx = pd.to_datetime(s.index)
-                # 統一去除時區
                 if idx.tz is not None:
                     idx = idx.tz_convert(None)
                 s = s.copy()
@@ -124,15 +122,8 @@ def _load_vix_series(cache_dir: str | None = None) -> pd.Series | None:
 
 
 def _get_vix_at(vix_series: pd.Series | None, date: pd.Timestamp) -> float | None:
-    """
-    取 date 當天或之前最近一個 VIX 值。
-    找不到時回傳 None。
-
-    v3.1: date 強制去除時區，確保與 tz-naive index 可比較。
-    """
     if vix_series is None or len(vix_series) == 0:
         return None
-    # 確保 date 是 tz-naive
     if hasattr(date, 'tz') and date.tz is not None:
         date = date.tz_localize(None) if date.tz is None else date.tz_convert(None)
     candidates = vix_series[vix_series.index <= date]
@@ -145,7 +136,6 @@ def _get_vix_at(vix_series: pd.Series | None, date: pd.Timestamp) -> float | Non
 # 代理人行為層
 # ──────────────────────────────────────────────────────────────────────────────
 def load_agent_profile(path: str | None) -> dict | None:
-    """載入 agent_profile.json，回傳 dict 或 None。"""
     if path is None:
         return None
     p = Path(path)
@@ -167,37 +157,21 @@ def apply_agent_profile(
     base_mr_coeff: float,
     vix_now: float | None = None,
 ) -> tuple[float, float]:
-    """
-    根據 agent_profile 調整 momentum_boost 和 mr_coeff。
-
-    散戶動能強 → momentum_boost 上調
-    大戶均值回歸強 → mr_coeff 上調
-    恐慌靈敏度高 + VIX 高 → momentum_boost 下調（拋售壓制動能）
-
-    v3 fix: inst_mr_strength clamp 到 [0.1, 1.0]，避免 H≈1 的股票
-    把 mr_coeff 壓到下界導致均值回歸力消失。
-    """
     if profile is None:
         return base_momentum_boost, base_mr_coeff
 
     retail_mom  = float(profile.get("retail_momentum_strength",  0.5))
     panic_sens  = float(profile.get("retail_panic_sensitivity",  0.3))
-    # v3: clamp inst_mr_strength，pure-trend (H≈1) 時仍保留最低 0.1
     inst_mr_raw = float(profile.get("inst_mr_strength", 0.5))
     inst_mr     = float(np.clip(inst_mr_raw, 0.1, 1.0))
     vix_cal     = float(profile.get("vix_level") or 20.0)
     vix_ref     = vix_now if vix_now is not None else vix_cal
 
-    # 散戶動能：0.5 為中性，>0.5 上調 momentum_boost
-    mom_adj = (retail_mom - 0.5) * 0.6   # 最多 ±0.3
-
-    # 恐慌修正：VIX 高時壓制動能
+    mom_adj   = (retail_mom - 0.5) * 0.6
     panic_adj = -panic_sens * float(np.clip((vix_ref - 20) / 30, 0.0, 1.0)) * 0.3
-
     new_momentum_boost = float(np.clip(base_momentum_boost + mom_adj + panic_adj, 0.3, 2.5))
 
-    # 大戶 MR：inst_mr > 0.5 增強回歸力（clamp 後不會因 0.0 變成負調整）
-    mr_adj = (inst_mr - 0.5) * 0.04   # 最多 ±0.02（clamp 後最少 -0.016）
+    mr_adj = (inst_mr - 0.5) * 0.04
     new_mr_coeff = float(np.clip(base_mr_coeff + mr_adj, 0.01, 0.20))
 
     return new_momentum_boost, new_mr_coeff
@@ -207,19 +181,10 @@ def apply_agent_profile(
 # Medoid 路徑選取
 # ──────────────────────────────────────────────────────────────────────────────
 def select_medoid_path(all_paths: np.ndarray) -> tuple[int, np.ndarray]:
-    """
-    從 all_paths (shape: n_paths x n_steps) 選出 medoid。
-    Medoid = 和其他所有路徑 Euclidean 距離總和最小的那條（保留波動、轉折，不平滑化）。
-
-    Returns:
-        medoid_idx : int
-        medoid_path: np.ndarray (n_steps,)
-    """
     n = all_paths.shape[0]
     if n == 1:
         return 0, all_paths[0]
 
-    # 樣本數大時用隨機子集加速（最多 200 條計算距離矩陣）
     if n > 200:
         idx_sample = np.random.choice(n, 200, replace=False)
         subset = all_paths[idx_sample]
@@ -242,14 +207,6 @@ def compute_pi_bands(
     p_low: float = 10.0,
     p_high: float = 90.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    計算每個時間步的 P10 / P90 百分位數。
-
-    Args:
-        all_paths: shape (n_paths, n_steps)
-    Returns:
-        p_low_arr, p_high_arr: 各 shape (n_steps,)
-    """
     lo = np.percentile(all_paths, p_low,  axis=0)
     hi = np.percentile(all_paths, p_high, axis=0)
     return lo, hi
@@ -260,9 +217,6 @@ def compute_coverage(
     p_lo:   np.ndarray,
     p_hi:   np.ndarray,
 ) -> float:
-    """
-    計算覆蓋率：實際收盤落在 [p_lo, p_hi] 的比例。
-    """
     n = min(len(actual), len(p_lo), len(p_hi))
     if n == 0:
         return float("nan")
@@ -271,20 +225,8 @@ def compute_coverage(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 參數模型
+# 特徵提取輔助函式（v2，與 collect_training_data.py 同步）
 # ──────────────────────────────────────────────────────────────────────────────
-def load_param_model(path: str | None):
-    if path is None:
-        return None
-    try:
-        import joblib
-    except ImportError:
-        raise ImportError("需要 joblib：pip install joblib")
-    payload = joblib.load(path)
-    print(f"[param-model] 載入 {path}  "
-          f"({payload['model_name']}, n_feat={len(payload['feature_cols'])})")
-    return payload
-
 
 def _garch_features(close_arr):
     try:
@@ -311,6 +253,155 @@ def _garch_features(close_arr):
         return {}
 
 
+# -- Group A helpers ----------------------------------------------------------
+def _adx(h, l, c, period=14):
+    n = len(c)
+    if n < period + 2:
+        return 20.0
+    tr  = np.maximum(h[1:] - l[1:],
+          np.maximum(np.abs(h[1:] - c[:-1]),
+                     np.abs(l[1:] - c[:-1])))
+    dmp = np.where((h[1:] - h[:-1]) > (l[:-1] - l[1:]),
+                   np.maximum(h[1:] - h[:-1], 0.0), 0.0)
+    dmm = np.where((l[:-1] - l[1:]) > (h[1:] - h[:-1]),
+                   np.maximum(l[:-1] - l[1:], 0.0), 0.0)
+
+    def _ema_wilder(arr, p):
+        out = np.empty(len(arr))
+        out[0] = arr[0]
+        k = 1.0 / p
+        for i in range(1, len(arr)):
+            out[i] = out[i-1] * (1 - k) + arr[i] * k
+        return out
+
+    atr   = _ema_wilder(tr,  period)
+    dipos = _ema_wilder(dmp, period) / (atr + 1e-8) * 100
+    dinos = _ema_wilder(dmm, period) / (atr + 1e-8) * 100
+    dx    = np.abs(dipos - dinos) / (dipos + dinos + 1e-8) * 100
+    adx   = _ema_wilder(dx, period)
+    return float(adx[-1])
+
+
+def _rsi(close_arr, period=14):
+    if len(close_arr) < period + 1:
+        return 50.0
+    delta = np.diff(close_arr.astype(float))
+    gain  = np.where(delta > 0, delta, 0.0)
+    loss  = np.where(delta < 0, -delta, 0.0)
+    avg_g = float(np.mean(gain[-period:]))
+    avg_l = float(np.mean(loss[-period:]))
+    if avg_l < 1e-10:
+        return 100.0
+    rs = avg_g / avg_l
+    return round(100.0 - 100.0 / (1.0 + rs), 4)
+
+
+def _obv_slope(close_arr, volume_arr, window=20):
+    if len(close_arr) < window + 1:
+        return 0.0
+    c = close_arr[-window-1:]
+    v = volume_arr[-window-1:]
+    direction = np.sign(np.diff(c))
+    obv = np.cumsum(direction * v[1:])
+    if len(obv) < 2:
+        return 0.0
+    x = np.arange(len(obv), dtype=float)
+    slope = float(np.polyfit(x, obv, 1)[0])
+    mean_vol = float(np.mean(v) + 1e-8)
+    return round(slope / mean_vol, 6)
+
+
+# -- Group B helpers ----------------------------------------------------------
+def _open_gap_stats(open_arr, close_arr, window=20):
+    if len(open_arr) < window + 1:
+        window = len(open_arr) - 1
+    if window < 2:
+        return 0.0, 0.0
+    gaps = open_arr[1:] / (close_arr[:-1] + 1e-8) - 1.0
+    gaps = gaps[-window:]
+    return float(np.mean(gaps)), float(np.std(gaps))
+
+
+def _open_range_ratio(open_arr, high_arr, low_arr, close_arr, window=20):
+    if len(open_arr) < window:
+        window = len(open_arr)
+    o = open_arr[-window:]
+    h = high_arr[-window:]
+    l = low_arr[-window:]
+    full_range = h - l + 1e-8
+    open_to_extreme = np.minimum(np.abs(o - h), np.abs(o - l))
+    ratio = open_to_extreme / full_range
+    return round(float(np.mean(ratio)), 4)
+
+
+def _amihud_illiq(close_arr, volume_arr, window=20):
+    if len(close_arr) < window + 1:
+        window = len(close_arr) - 1
+    if window < 2:
+        return 0.0
+    c = close_arr[-window-1:]
+    v = volume_arr[-window-1:]
+    rets   = np.abs(np.diff(np.log(c + 1e-8)))
+    dollar = (c[1:] * v[1:] + 1e-8)
+    illiq  = rets / dollar * 1e6
+    return round(float(np.mean(illiq)), 6)
+
+
+# -- Group C helpers ----------------------------------------------------------
+def _hurst_rs(close_arr, window=100):
+    c = close_arr[-window:] if len(close_arr) >= window else close_arr
+    n = len(c)
+    if n < 20:
+        return 0.5
+    log_rets = np.diff(np.log(c + 1e-8))
+    lags = [max(2, n // 8), max(4, n // 4), max(8, n // 2), n - 1]
+    lags = sorted(set([l for l in lags if 2 <= l < len(log_rets)]))
+    if len(lags) < 2:
+        return 0.5
+    rs_vals = []
+    for lag in lags:
+        sub = log_rets[:lag]
+        mean_sub = np.mean(sub)
+        dev = np.cumsum(sub - mean_sub)
+        r = float(np.max(dev) - np.min(dev))
+        s = float(np.std(sub, ddof=1) + 1e-10)
+        rs_vals.append(r / s)
+    log_lags = np.log(lags)
+    log_rs   = np.log(np.array(rs_vals) + 1e-10)
+    if np.ptp(log_lags) < 1e-8:
+        return 0.5
+    h = float(np.polyfit(log_lags, log_rs, 1)[0])
+    return round(float(np.clip(h, 0.1, 0.9)), 4)
+
+
+def _trend_consistency(log_rets, window=20):
+    if len(log_rets) < window:
+        window = len(log_rets)
+    if window < 2:
+        return 0.5
+    r = log_rets[-window:]
+    up_ratio = float(np.sum(r > 0)) / window
+    return round(max(up_ratio, 1.0 - up_ratio), 4)
+
+
+def _vol_of_vol(log_rets, outer_window=60, inner_window=5):
+    if len(log_rets) < outer_window:
+        outer_window = len(log_rets)
+    if outer_window < inner_window + 2:
+        return 0.0
+    rets = log_rets[-outer_window:]
+    roll_vols = [
+        float(np.std(rets[max(0, i-inner_window):i]))
+        for i in range(inner_window, len(rets) + 1)
+    ]
+    if len(roll_vols) < 2:
+        return 0.0
+    return round(float(np.std(roll_vols)) * 100, 4)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _extract_features v2（與 collect_training_data.py 完全同步）
+# ──────────────────────────────────────────────────────────────────────────────
 def _extract_features(df_window: pd.DataFrame, theta_vol: float) -> dict:
     c = df_window["Close"].values.astype(float)
     o = df_window["Open"].values.astype(float)
@@ -320,6 +411,7 @@ def _extract_features(df_window: pd.DataFrame, theta_vol: float) -> dict:
 
     log_rets = np.diff(np.log(c))
 
+    # -- v1 原有特徵 -----------------------------------------------------------
     vol_20  = float(np.std(log_rets[-20:])) if len(log_rets) >= 20 else float(np.std(log_rets))
     vol_60  = float(np.std(log_rets[-60:])) if len(log_rets) >= 60 else float(np.std(log_rets))
     vol_all = float(np.std(log_rets))
@@ -356,30 +448,82 @@ def _extract_features(df_window: pd.DataFrame, theta_vol: float) -> dict:
         bb_drift_std  = 0.0
         bb_vol_std    = 0.0
 
+    # -- Group A: 趨勢強度 -----------------------------------------------------
+    adx_val      = _adx(h, l, c, period=14)
+    rsi_val      = _rsi(c, period=14)
+    c_52w        = c[-252:] if len(c) >= 252 else c
+    c_min, c_max = float(np.min(c_52w)), float(np.max(c_52w))
+    price_pos_52w = round((c[-1] - c_min) / (c_max - c_min + 1e-8), 4)
+    obv_slope_val = _obv_slope(c, v, window=20)
+
+    # -- Group B: 開盤 / 流動性 ------------------------------------------------
+    gap_mean, gap_vol = _open_gap_stats(o, c, window=20)
+    open_rng_ratio    = _open_range_ratio(o, h, l, c, window=20)
+    amihud_val        = _amihud_illiq(c, v, window=20)
+
+    # -- Group C: 市場狀態 -----------------------------------------------------
+    hurst_val      = _hurst_rs(c, window=100)
+    trend_cons_val = _trend_consistency(log_rets, window=20)
+    vov_val        = _vol_of_vol(log_rets, outer_window=60, inner_window=5)
+    skew_20_val    = float(pd.Series(log_rets[-20:]).skew()) if len(log_rets) >= 20 else 0.0
+    skew_20_val    = 0.0 if np.isnan(skew_20_val) else round(skew_20_val, 4)
+
     feat = {
-        "vol_20":             round(vol_20 * 100, 4),
-        "vol_60":             round(vol_60 * 100, 4),
-        "vol_all":            round(vol_all * 100, 4),
-        "vol_ratio_20_60":    round(vol_20 / (vol_60 + 1e-8), 4),
-        "vol_ratio_rv_theta": round(vol_20 / (theta_vol + 1e-8), 4),
-        "drift_20":           round(drift_20 * 100, 4),
-        "drift_60":           round(drift_60 * 100, 4),
-        "drift_all":          round(drift_all * 100, 4),
-        "drift_ratio_20_all": round(
+        # v1 原有
+        "vol_20":               round(vol_20 * 100, 4),
+        "vol_60":               round(vol_60 * 100, 4),
+        "vol_all":              round(vol_all * 100, 4),
+        "vol_ratio_20_60":      round(vol_20 / (vol_60 + 1e-8), 4),
+        "vol_ratio_rv_theta":   round(vol_20 / (theta_vol + 1e-8), 4),
+        "drift_20":             round(drift_20 * 100, 4),
+        "drift_60":             round(drift_60 * 100, 4),
+        "drift_all":            round(drift_all * 100, 4),
+        "drift_ratio_20_all":   round(
             drift_20 / (abs(drift_all) + 1e-8) * np.sign(drift_all + 1e-12), 4
         ),
-        "ret_autocorr":    round(ret_autocorr, 4),
-        "vol_autocorr":    round(vol_autocorr, 4),
-        "avg_body_pct":    round(avg_body * 100, 4),
-        "median_sr":       round(median_sr, 4),
-        "p90_sr":          round(p90_sr, 4),
-        "bb_last_drift":   round(bb_last_drift * 100, 4),
-        "bb_last_vol":     round(bb_last_vol * 100, 4),
-        "bb_drift_std":    round(bb_drift_std * 100, 4),
-        "bb_vol_std":      round(bb_vol_std * 100, 4),
+        "ret_autocorr":         round(ret_autocorr, 4),
+        "vol_autocorr":         round(vol_autocorr, 4),
+        "avg_body_pct":         round(avg_body * 100, 4),
+        "median_sr":            round(median_sr, 4),
+        "p90_sr":               round(p90_sr, 4),
+        "bb_last_drift":        round(bb_last_drift * 100, 4),
+        "bb_last_vol":          round(bb_last_vol * 100, 4),
+        "bb_drift_std":         round(bb_drift_std * 100, 4),
+        "bb_vol_std":           round(bb_vol_std * 100, 4),
+        # Group A
+        "trend_strength_adx":   round(adx_val, 4),
+        "rsi_14":               round(rsi_val, 4),
+        "price_pos_52w":        price_pos_52w,
+        "obv_slope":            obv_slope_val,
+        # Group B
+        "open_gap_mean":        round(gap_mean * 100, 4),
+        "open_gap_vol":         round(gap_vol * 100, 4),
+        "open_range_ratio":     open_rng_ratio,
+        "amihud_illiq":         amihud_val,
+        # Group C
+        "hurst_exp":            hurst_val,
+        "trend_consistency_20": trend_cons_val,
+        "vol_of_vol":           vov_val,
+        "skew_20":              skew_20_val,
     }
     feat.update(_garch_features(c))
     return feat
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 參數模型
+# ──────────────────────────────────────────────────────────────────────────────
+def load_param_model(path: str | None):
+    if path is None:
+        return None
+    try:
+        import joblib
+    except ImportError:
+        raise ImportError("需要 joblib：pip install joblib")
+    payload = joblib.load(path)
+    print(f"[param-model] 載入 {path}  "
+          f"({payload['model_name']}, n_feat={len(payload['feature_cols'])})")
+    return payload
 
 
 def apply_param_model(
@@ -427,21 +571,6 @@ def _run_one_step(
     vix_series: pd.Series | None = None,
     cutoff_date: pd.Timestamp | None = None,
 ) -> tuple[np.ndarray, dict | None, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Returns:
-        rep_close   : medoid 路徑收盤 (step,)
-        ohlc        : medoid OHLC dict or None
-        all_closes  : 所有路徑收盤 (n_paths, step)
-        p10         : P10 per bar   (step,)
-        p90         : P90 per bar   (step,)
-
-    v3 changes:
-        - vix_series / cutoff_date 參數用於查詢當輪 VIX
-        - result.future_paths 直接用（修復 P10/P90 = 0% 的 bug）
-
-    v3.1:
-        - cutoff_date 去除時區後傳入 _get_vix_at，避免 tz-aware vs tz-naive TypeError
-    """
     step = args.step
 
     calib = auto_calibrate(
@@ -469,9 +598,7 @@ def _run_one_step(
     drift_scale     = calib["drift_scale"]
     drift_clamp_max = calib["drift_clamp_max"]
 
-    # ── 代理人行為調整（v3.1：cutoff_date 強制 tz-naive）──────────────────
-    base_mr = theta.mr_coeff
-    # 確保 cutoff_date 是 tz-naive
+    base_mr     = theta.mr_coeff
     safe_cutoff = None
     if cutoff_date is not None:
         safe_cutoff = cutoff_date
@@ -484,7 +611,6 @@ def _run_one_step(
         base_mr,
         vix_now=vix_now,
     )
-    # ────────────────────────────────────────────────────────
 
     fitter     = BackboneFitter(n_seg=6, smooth_reg=0.5)
     bb_result  = fitter.fit(close_hist)
@@ -581,10 +707,8 @@ def _run_one_step(
     )
     result = sim.simulate()
 
-    # ── v3 fix: 直接用 result.future_paths（shape: n_paths x n_steps）──
-    all_closes = result.future_paths[:, :step]   # (n_paths, step)
+    all_closes = result.future_paths[:, :step]
 
-    # ── Medoid 選取 ─────────────────────────────────────────
     medoid_idx, medoid_close = select_medoid_path(all_closes)
     p10, p90 = compute_pi_bands(all_closes)
 
@@ -592,7 +716,6 @@ def _run_one_step(
     p10 = p10[:step]
     p90 = p90[:step]
 
-    # 從模擬結果中取 representative path 的 OHLC，用 medoid close 覆蓋
     ohlc = None
     rep_close, rep_ohlc = pick_representative_path(result)
     if rep_ohlc is not None:
@@ -631,7 +754,6 @@ def rolling_forward(
 
     actual_prev_closes: list[float] = []
 
-    # 取得 df 的日期序列，用於查 VIX
     if "Date" in df.columns:
         df_dates = pd.to_datetime(df["Date"])
     elif "Datetime" in df.columns:
@@ -654,7 +776,6 @@ def rolling_forward(
         start_price = float(close_hist[-1])
         print(f"  [輪 {rnd+1}/{rounds}]  訓練截至 idx={cur_end-1}  起點={start_price:.2f}  預測 {need} 根")
 
-        # v3: 取本輪訓練截止日，用於查詢 VIX
         cutoff_date = df_dates.iloc[cur_end - 1] if cur_end - 1 < len(df_dates) else None
 
         med, ohlc, all_c, p10, p90 = _run_one_step(
@@ -760,7 +881,6 @@ def render_rolling(
     hist_x = np.arange(-len(hist_close), 0)
     ax.plot(hist_x, hist_close, color="#555", lw=1.2, label="歷史", zorder=4)
 
-    # P10/P90 信心區間
     if p10 is not None and p90 is not None and len(p10) == total:
         x_band = np.arange(total)
         ax.fill_between(
@@ -983,10 +1103,8 @@ def parse_args():
                    choices=["gjr-garch", "garch"])
     p.add_argument("--auto-calibrate",      action="store_true", default=True)
     p.add_argument("--param-model",         default=None)
-    p.add_argument("--agent-profile",       default=None,
-                   help="agent_profile.json 路徑，提供散戶/大戶行為參數")
-    p.add_argument("--cache-dir",           default=None,
-                   help="macro.parquet 所在目錄（預設自動偵測 cache/）")
+    p.add_argument("--agent-profile",       default=None)
+    p.add_argument("--cache-dir",           default=None)
     p.add_argument("--output-dir",          default="results")
     p.add_argument("--verbose",             action="store_true")
     p.add_argument("--short-drift-weight",  type=float, default=0.4)
@@ -1019,7 +1137,6 @@ def main():
     agent_profile       = load_agent_profile(getattr(args, "agent_profile", None))
     label_suffix = "agent+medoid" if agent_profile is not None else "medoid"
 
-    # v3: 載入 VIX 序列（找不到 macro.parquet 時靜默略過）
     vix_series = _load_vix_series(cache_dir=getattr(args, "cache_dir", None))
     if vix_series is not None:
         print(f"[vix] 載入 {len(vix_series)} 根 VIX  ({vix_series.index[0].date()} ~ {vix_series.index[-1].date()})")
@@ -1108,6 +1225,7 @@ def main():
         "dynamic_drift":  args.dynamic_drift,
         "dir_definition": "sign(pred-prev_actual)==sign(actual-prev_actual)",
         "path_selection": "medoid",
+        "feature_version": "v2",
     }
 
     if result["actual_closes"] is not None:
