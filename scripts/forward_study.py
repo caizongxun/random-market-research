@@ -9,6 +9,9 @@ v9 修正：
   4. 移除 auto-calibrate 區塊的重複 inline print
   5. 移除 USStockFutureSimulator 不支援的參數：
      shadow_noise_scale / shadow_clamp_sigma / body_scale_max
+  6. 改以「representative path」取代逐日中位數：
+     從 future_paths 中挑出與 pointwise-median MAE 最小的那一條，
+     保留每日隨機抖動，不再出現水平死線。
 
 用法：
   python scripts/forward_study.py \
@@ -90,6 +93,17 @@ def ensure_ohlcv(df):
     return df[["Open", "High", "Low", "Close", "Volume"]].dropna().reset_index()
 
 
+def pick_representative_path(paths: np.ndarray) -> np.ndarray:
+    """
+    從 paths (n_paths x T) 中挑出與逐日中位數 MAE 最小的那一條。
+    這條路徑保留了每日隨機抖動，又在統計上最「中間」。
+    """
+    pointwise_median = np.median(paths, axis=0)           # shape (T,)
+    maes = np.mean(np.abs(paths - pointwise_median), axis=1)  # shape (n_paths,)
+    best_idx = int(np.argmin(maes))
+    return paths[best_idx]                                # shape (T,)
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--symbol",         required=True)
@@ -99,13 +113,13 @@ def parse_args():
     p.add_argument("--forecast",       type=int,   default=30)
     p.add_argument("--n-paths",        type=int,   default=500)
     p.add_argument("--intra-bar",      type=int,   default=None)
-    p.add_argument("--shadow-noise",   type=float, default=None)   # kept for calib record only
-    p.add_argument("--shadow-clamp",   type=float, default=None)   # kept for calib record only
+    p.add_argument("--shadow-noise",   type=float, default=None)
+    p.add_argument("--shadow-clamp",   type=float, default=None)
     p.add_argument("--momentum-boost", type=float, default=None)
     p.add_argument("--drift-decay",    type=float, default=None)
     p.add_argument("--vol-multiplier", type=float, default=None)
     p.add_argument("--drift-scale",    type=float, default=None)
-    p.add_argument("--body-scale-max", type=float, default=None)   # kept for record only
+    p.add_argument("--body-scale-max", type=float, default=None)
     p.add_argument("--auto-calibrate",  action="store_true")
     p.add_argument("--calib-window",   type=int,   default=500)
     p.add_argument("--no-garch",        action="store_true")
@@ -202,7 +216,7 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
 # ──────────────────────────────────────────────────────────────────────────────
 def render_forecast(
     symbol, hist_close, result, forecast, end_date_str,
-    output_dir, mode_tag, median_path,
+    output_dir, mode_tag, rep_path,
     actual_close=None,
 ):
     fig, ax = plt.subplots(figsize=(14, 6))
@@ -210,15 +224,15 @@ def render_forecast(
     ax.plot(hist_x, hist_close, color="#555555", lw=1.2, label="歷史收盤")
 
     fwd_x = np.arange(0, forecast)
-    # SimulationResult 用 p10/p25/p75/p90 屬性（v7）
+
     if hasattr(result, "p10") and result.p10 is not None:
         ax.fill_between(fwd_x, result.p10[:forecast], result.p90[:forecast],
                         alpha=0.15, color="#2196F3", label="P10-P90")
         ax.fill_between(fwd_x, result.p25[:forecast], result.p75[:forecast],
                         alpha=0.25, color="#2196F3", label="P25-P75")
 
-    mp = median_path[:forecast]
-    ax.plot(fwd_x[:len(mp)], mp, color="#E53935", lw=2, label="中位數預測")
+    rp = rep_path[:forecast]
+    ax.plot(fwd_x[:len(rp)], rp, color="#E53935", lw=1.8, label="代表路徑（最近P50）")
 
     if actual_close is not None and len(actual_close) > 0:
         n = min(len(actual_close), forecast)
@@ -492,12 +506,6 @@ def main():
     print(f"  drift_scale={args.drift_scale}  drift_decay={args.drift_decay}  "
           f"vol_multiplier={args.vol_multiplier}  momentum_boost={args.momentum_boost}")
 
-    # USStockFutureSimulator v7 接受的參數：
-    # params / forecast_steps / n_paths / seed / vol_scale /
-    # mr_coeff / node_coeff / momentum_strength / momentum_decay / breakout_boost /
-    # drift_schedule / vol_schedule / backbone_schedule / backbone_mr_coeff /
-    # intra_bar_steps / drift_decay_rate / drift_scale / momentum_anchor_weight
-    # 『shadow_noise_scale / shadow_clamp_sigma / body_scale_max』 已移除
     sim = USStockFutureSimulator(
         params=params_fwd,
         forecast_steps=args.forecast,
@@ -520,25 +528,28 @@ def main():
     )
     result = sim.simulate()
 
-    # ── median_path ──
-    if hasattr(result, "median_path") and result.median_path is not None:
-        median_path = result.median_path
+    # ── 代表路徑（最近 P50 的單條路徑，保留每日抖動） ──
+    if hasattr(result, "future_paths") and result.future_paths is not None:
+        future_paths = np.asarray(result.future_paths)  # (n_paths, T)
+        rep_path = pick_representative_path(future_paths)
+    elif hasattr(result, "median_path") and result.median_path is not None:
+        # fallback：若 SimulationResult 只有 median_path，直接用
+        rep_path = np.asarray(result.median_path)
     else:
-        if hasattr(result, "future_paths") and result.future_paths is not None:
-            median_path = np.median(result.future_paths, axis=0)
-        else:
-            median_path = np.full(args.forecast, start_price)
+        rep_path = np.full(args.forecast, start_price)
+
+    rep_path = rep_path[:args.forecast]
 
     # ── summary ──
-    n          = min(len(median_path), args.forecast)
-    final_pred = float(median_path[n - 1])
+    n          = len(rep_path)
+    final_pred = float(rep_path[n - 1])
     total_ret  = (final_pred - start_price) / start_price * 100
     print(f"\n  起點價格 : {start_price:.2f}")
     print(f"  預測終點 : {final_pred:.2f}  ({total_ret:+.1f}%  {n}日)")
 
     if actual_close is not None and len(actual_close) > 0:
         na  = min(len(actual_close), n)
-        mae = float(np.mean(np.abs(actual_close[:na] - median_path[:na]) / start_price * 100))
+        mae = float(np.mean(np.abs(actual_close[:na] - rep_path[:na]) / start_price * 100))
         actual_ret = (float(actual_close[na - 1]) - start_price) / start_price * 100
         print(f"  實際終點 : {actual_close[na-1]:.2f}  ({actual_ret:+.1f}%)")
         print(f"  MAE      : {mae:.2f}%")
@@ -566,7 +577,7 @@ def main():
         },
         "auto_calibrate":  args.auto_calibrate,
         "model_predicted": model_predicted_params,
-        "median_path":     [round(float(x), 4) for x in median_path[:args.forecast]],
+        "rep_path":        [round(float(x), 4) for x in rep_path],
     }
 
     json_path = out_path / f"{args.symbol}_{end_date_str}_{mode_tag}.json"
@@ -582,7 +593,7 @@ def main():
         end_date_str=end_date_str,
         output_dir=args.output_dir,
         mode_tag=mode_tag,
-        median_path=median_path,
+        rep_path=rep_path,
         actual_close=actual_close,
     )
     print(f"\n✔ 完成")
