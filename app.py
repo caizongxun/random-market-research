@@ -55,15 +55,25 @@ def get_ohlcv(symbol: str, start: str, end: str) -> pd.DataFrame:
 
 
 def calibrate_theta(df: pd.DataFrame) -> CalibratedTheta:
-    est = MarketParameterEstimator(df)
-    params = est.estimate()
+    """
+    使用 MarketParameterEstimator.fit() 校準 theta。
+    MarketParams 欄位對應：
+      realized_vol          -> vol
+      mean_reversion_strength -> mr_coeff
+      smart_money_ratio     -> node_coeff
+      trend_strength        -> momentum_strength
+      hurst_proxy           -> momentum_decay (proxy)
+      vol_trend             -> breakout_boost (proxy)
+    """
+    estimator = MarketParameterEstimator()
+    params = estimator.fit(df)
     return CalibratedTheta(
-        vol=params.get("vol", 0.015),
-        mr_coeff=params.get("mr_coeff", 0.02),
-        node_coeff=params.get("node_coeff", 0.3),
-        momentum_strength=params.get("momentum_strength", 0.25),
-        momentum_decay=params.get("momentum_decay", 0.85),
-        breakout_boost=params.get("breakout_boost", 1.5),
+        vol=float(params.realized_vol),
+        mr_coeff=float(params.mean_reversion_strength) * 0.1 + 0.01,
+        node_coeff=float(params.smart_money_ratio),
+        momentum_strength=float(params.trend_strength) * 0.5 + 0.1,
+        momentum_decay=float(np.clip(params.hurst_proxy, 0.5, 0.95)),
+        breakout_boost=float(np.clip(params.vol_trend, 1.0, 3.0)),
     )
 
 
@@ -76,7 +86,6 @@ def auto_calibrate(df_window: pd.DataFrame) -> dict:
     vol = float(np.std(log_rets)) if len(log_rets) >= 20 else 0.015
     drift = float(np.mean(log_rets)) if len(log_rets) >= 20 else 0.0
 
-    # drift_scale：drift 越強，scale 越大
     drift_scale = float(np.clip(abs(drift) / max(vol, 1e-6) * 0.8 + 0.5, 0.3, 3.2))
     drift_decay = 0.05
     vol_multiplier = float(np.clip(vol / 0.015, 0.5, 3.0))
@@ -127,12 +136,17 @@ def run_simulation(
             seed=int(s),
         )
         bars = sim.simulate()
+        # 相容 list/dict 與 dataclass/namedtuple 兩種回傳格式
+        def _get(b, key):
+            if isinstance(b, dict):
+                return b[key]
+            return getattr(b, key)
         path = [
             {
-                "open": round(float(b["open"]), 4),
-                "high": round(float(b["high"]), 4),
-                "low": round(float(b["low"]), 4),
-                "close": round(float(b["close"]), 4),
+                "open": round(float(_get(b, "open")), 4),
+                "high": round(float(_get(b, "high")), 4),
+                "low": round(float(_get(b, "low")), 4),
+                "close": round(float(_get(b, "close")), 4),
             }
             for b in bars
         ]
@@ -172,7 +186,6 @@ def api_simulate():
             seed = int(seed)
 
         end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
-        # 下載足夠的歷史資料（多抓 2 年讓校準穩定）
         fetch_start = (end_dt - timedelta(days=900)).strftime("%Y-%m-%d")
         fetch_end = (end_dt + timedelta(days=forecast_bars * 2 + 30)).strftime("%Y-%m-%d")
 
@@ -180,21 +193,17 @@ def api_simulate():
         if df_all.empty or len(df_all) < 60:
             return jsonify({"error": f"資料不足：{symbol} {fetch_start}~{fetch_end}"}), 400
 
-        # 切分訓練 / 實際未來
         df_hist = df_all[df_all["Date"] <= end_dt].copy()
         df_future = df_all[df_all["Date"] > end_dt].head(forecast_bars).copy()
 
         if len(df_hist) < 60:
             return jsonify({"error": "end_date 之前的歷史資料不足 60 根"}), 400
 
-        # 校準
         theta = calibrate_theta(df_hist)
         auto_params = auto_calibrate(df_hist)
 
-        # 顯示用：取最後 hist_bars 根歷史 K 棒
         df_display_hist = df_hist.tail(hist_bars).copy()
 
-        # 模擬
         paths = run_simulation(
             df_hist=df_hist,
             theta=theta,
@@ -204,20 +213,17 @@ def api_simulate():
             seed=seed,
         )
 
-        # 產生模擬路徑的時間軸（用實際交易日 or 順延日曆日）
         last_date = df_hist["Date"].iloc[-1]
         if not df_future.empty:
             future_dates = df_future["Date"].tolist()
         else:
-            # 沒有真實資料時，用日曆日順延（跳過週末）
             future_dates = []
             d = last_date
             while len(future_dates) < forecast_bars:
                 d = d + timedelta(days=1)
-                if d.weekday() < 5:  # Mon-Fri
+                if d.weekday() < 5:
                     future_dates.append(d)
 
-        # 確保 future_dates 夠長
         while len(future_dates) < forecast_bars:
             d = future_dates[-1] + timedelta(days=1)
             while d.weekday() >= 5:
@@ -227,7 +233,6 @@ def api_simulate():
         future_dates = future_dates[:forecast_bars]
         future_ts = [int(pd.Timestamp(d).timestamp()) for d in future_dates]
 
-        # 加上時間戳
         sim_paths_ts = []
         for path in paths:
             path_ts = []
@@ -495,11 +500,9 @@ function clearSeries() {
 
 function renderData(data, chosenPaths) {
   clearSeries();
-  // ── 選取 chosenPaths 條 ──
   const allPaths = data.sim_paths;
   let paths = chosenPaths;
   if (!paths) {
-    // 隨機抽 n_paths 條
     const n = Math.min(parseInt(document.getElementById('n-paths').value) || 5, allPaths.length);
     const idx = shuffleIndices(allPaths.length).slice(0, n);
     paths = idx.map(i => allPaths[i]);
@@ -571,7 +574,6 @@ async function runSim() {
   document.getElementById('resim-btn').disabled = true;
 
   try {
-    // 多抓路徑以便重新抽樣
     const fetchPaths = Math.max(nPaths * 3, 15);
     lastSeed = Math.floor(Math.random() * 99999);
     const resp = await fetch('/api/simulate', {
@@ -586,13 +588,16 @@ async function runSim() {
       }),
     });
     const data = await resp.json();
-    if (data.error) { showToast(data.error); return; }
+    if (data.error) {
+      showToast(data.error);
+      if (data.trace) console.error(data.trace);
+      return;
+    }
 
     lastData = data;
     if (!chart) initChart();
     renderData(data, null);
 
-    // 更新 info bar
     const ap = data.auto_params;
     const th = data.theta;
     document.getElementById('info-text').innerHTML = [
