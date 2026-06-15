@@ -1,11 +1,15 @@
 """
-forward_study.py  v10  (GJR-GARCH + auto-calibrate + OHLC K線預測)
+forward_study.py  v11  (GJR-GARCH + auto-calibrate + OHLC K線預測)
 
-v10 修正：
+v11 修正（貼近實際走勢）：
+  1. 保留 estimator 算出的 momentum_bias + node_breakout_state
+     不再強制歸零 → 讓預測起點的短期動能（含空頭偏壓）自然傳入模擬器
+  2. backbone drift 改為「短期 5 日 drift × 0.4 + 長期 last_drift × 0.6」混合
+     起初期路徑能反映近期趨勢轉折（如急跌），而非硬貼長期上升斜率
+
+v10 已有：
   1. render_forecast 改用手繪 K 線（矩形 body + 上下影線）
-     直接取用 result.ohlcv_open/high/low/close（已由 USStockFutureSimulator._build_ohlcv 產生）
-  2. pick_representative_path 改成從 SimulationResult 直接讀 representative_path + ohlcv_*
-     不再重複計算；若 result.representative_path 是空 array 才 fallback 到舊邏輯
+  2. pick_representative_path 從 SimulationResult 直接讀 representative_path + ohlcv_*
   3. 歷史段維持折線，預測段改為逐根 K 線
 
 用法：
@@ -13,7 +17,6 @@ v10 修正：
     --symbol AAPL \\
     --theta results/theta_aapl.json \\
     --auto-calibrate \\
-    --param-model models/param_model_AAPL.joblib \\
     --end-date 2024-01-03
 """
 
@@ -155,6 +158,9 @@ def parse_args():
     p.add_argument("--param-model",    default=None)
     p.add_argument("--output-dir",     default="results")
     p.add_argument("--verbose",         action="store_true")
+    # v11: short-drift blend weight (預設 0.4)
+    p.add_argument("--short-drift-weight", type=float, default=0.4,
+                   help="近期 5 日 drift 在 backbone 混合中的權重 (0~1，預設 0.4)")
     return p.parse_args()
 
 
@@ -209,9 +215,12 @@ def auto_calibrate(
 # ──────────────────────────────────────────────────────────────────────────────
 # print_diagnostics
 # ──────────────────────────────────────────────────────────────────────────────
-def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dict | None):
+def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dict | None,
+                      momentum_bias: float = 0.0, breakout_state: int = 0,
+                      blend_drift: float = 0.0, short_drift: float = 0.0,
+                      last_drift: float = 0.0):
     print("\n" + "─" * 60)
-    print("  VERBOSE DIAGNOSTICS (v10 GJR-GARCH + auto-calibrate + param-model)")
+    print("  VERBOSE DIAGNOSTICS (v11 GJR-GARCH + momentum_bias + blend drift)")
     print("─" * 60)
     if calib_info:
         gi  = calib_info.get("_garch_info", {})
@@ -225,12 +234,20 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
                   f"β={gi.get('beta','?')}  persist={gi.get('persistence','?')}")
         elif "error" in gi:
             print(f"  GARCH error   : {gi['error']}")
+    print(f"\n  [動能狀態]")
+    print(f"  momentum_bias   : {momentum_bias:+.4f}  (estimator 原值，不歸零)")
+    print(f"  breakout_state  : {breakout_state}")
+    print(f"\n  [backbone drift 混合]")
+    print(f"  short_drift(5d) : {short_drift*100:+.4f}%/day")
+    print(f"  last_drift(bb)  : {last_drift*100:+.4f}%/day")
+    print(f"  blend_drift     : {blend_drift*100:+.4f}%/day  "
+          f"(w={args.short_drift_weight:.1f}×short + {1-args.short_drift_weight:.1f}×long)")
     print(f"\n  [最終模擬參數]")
-    print(f"  intra_bar     : {args.intra_bar}")
-    print(f"  momentum_boost: {args.momentum_boost}")
-    print(f"  drift_decay   : {args.drift_decay}")
-    print(f"  vol_multiplier: {args.vol_multiplier}")
-    print(f"  drift_scale   : {args.drift_scale}")
+    print(f"  intra_bar       : {args.intra_bar}")
+    print(f"  momentum_boost  : {args.momentum_boost}")
+    print(f"  drift_decay     : {args.drift_decay}")
+    print(f"  vol_multiplier  : {args.vol_multiplier}")
+    print(f"  drift_scale     : {args.drift_scale}")
     if model_predicted_params:
         print(f"\n  [param-model 覆蓋]")
         print(f"  drift_scale   : {model_predicted_params.get('drift_scale', 'N/A')}")
@@ -245,19 +262,12 @@ def _draw_candles(ax, x_arr, o_arr, h_arr, l_arr, c_arr,
                   width=0.6,
                   bull_color="#26A69A", bear_color="#EF5350",
                   alpha=0.9):
-    """
-    在 ax 上用 Matplotlib patches 手繪 K 線。
-    x_arr : x 座標（整數或浮點，逐根）
-    o/h/l/c : 各根 OHLC 陣列，長度與 x_arr 相同
-    """
     for xi, o, h, l, c in zip(x_arr, o_arr, h_arr, l_arr, c_arr):
         color  = bull_color if c >= o else bear_color
-        # ── 影線 ──
         ax.plot([xi, xi], [l, h], color=color, lw=0.9, alpha=alpha, zorder=2)
-        # ── 實體 ──
         body_y = min(o, c)
         body_h = abs(c - o)
-        if body_h < 1e-8:          # 十字星：畫一條橫線
+        if body_h < 1e-8:
             ax.plot([xi - width / 2, xi + width / 2],
                     [c, c], color=color, lw=1.2, alpha=alpha, zorder=3)
         else:
@@ -274,7 +284,7 @@ def _draw_candles(ax, x_arr, o_arr, h_arr, l_arr, c_arr,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# render_forecast  v10 — 歷史折線 + 預測 K 線
+# render_forecast  v11 — 歷史折線 + 預測 K 線
 # ──────────────────────────────────────────────────────────────────────────────
 def render_forecast(
     symbol, hist_close, result, forecast, end_date_str,
@@ -282,17 +292,11 @@ def render_forecast(
     rep_close, ohlc,
     actual_close=None,
 ):
-    """
-    rep_close : np.ndarray  shape (≤forecast,)   代表路徑收盤
-    ohlc      : dict {open/high/low/close} 或 None
-    """
     fig, ax = plt.subplots(figsize=(15, 6))
 
-    # ── 歷史折線 ──
     hist_x = np.arange(-len(hist_close), 0)
     ax.plot(hist_x, hist_close, color="#555555", lw=1.2, label="歷史收盤", zorder=4)
 
-    # ── 信心帶 ──
     fwd_x = np.arange(0, forecast)
     if hasattr(result, "p10") and result.p10 is not None:
         ax.fill_between(fwd_x, result.p10[:forecast], result.p90[:forecast],
@@ -300,7 +304,6 @@ def render_forecast(
         ax.fill_between(fwd_x, result.p25[:forecast], result.p75[:forecast],
                         alpha=0.22, color="#2196F3", label="P25-P75")
 
-    # ── 預測 K 線 ──
     n = min(len(rep_close), forecast)
     x_candle = np.arange(n)
 
@@ -310,7 +313,6 @@ def render_forecast(
         l_arr = ohlc["low"][:n]
         c_arr = ohlc["close"][:n]
     else:
-        # OHLC 不可用：合成最簡版（open=prev_close, high/low 用±0.5%）
         c_arr = rep_close[:n]
         o_arr = np.concatenate([[hist_close[-1]], c_arr[:-1]])
         spread = c_arr * 0.005
@@ -319,11 +321,9 @@ def render_forecast(
 
     _draw_candles(ax, x_candle, o_arr, h_arr, l_arr, c_arr)
 
-    # 圖例用的假 patch
     bull_patch = mpatches.Patch(color="#26A69A", label="預測漲K")
     bear_patch = mpatches.Patch(color="#EF5350", label="預測跌K")
 
-    # ── 實際收盤（虛線） ──
     if actual_close is not None and len(actual_close) > 0:
         na = min(len(actual_close), forecast)
         ax.plot(fwd_x[:na], actual_close[:na],
@@ -519,7 +519,7 @@ def main():
     if args.auto_calibrate:
         calib_window = args.calib_window
         model_label  = args.garch_model if use_garch else "rv"
-        print(f"\n[auto-calibrate v10] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
+        print(f"\n[auto-calibrate v11] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             df.iloc[:train_end_idx]["Close"].values.astype(float),
             theta,
@@ -563,17 +563,21 @@ def main():
             args.drift_decay = model_predicted_params["drift_decay"]
         print(f"[param-model] 預測參數: {model_predicted_params}")
 
-    if args.verbose:
-        print_diagnostics(args, calib_info, model_predicted_params)
-
     # ── backbone ──
+    # v11: 混合近期 5 日 drift 與 backbone 長期 drift
     fitter     = BackboneFitter(n_seg=6, smooth_reg=0.5)
     bb_result  = fitter.fit(close_hist)
     last_drift = float(bb_result.segment_drifts[-1])
     last_vol   = float(bb_result.segment_vols[-1])
-    drift_fwd  = np.full(args.forecast, last_drift)
-    vol_fwd    = np.full(args.forecast, last_vol) * (args.vol_multiplier or 1.0)
-    bb_fwd     = start_price * np.cumprod(1 + drift_fwd)
+
+    log_ret_hist = np.diff(np.log(close_hist))
+    short_drift  = float(np.mean(log_ret_hist[-5:])) if len(log_ret_hist) >= 5 else last_drift
+    w            = float(np.clip(args.short_drift_weight, 0.0, 1.0))
+    blend_drift  = w * short_drift + (1.0 - w) * last_drift
+
+    drift_fwd = np.full(args.forecast, blend_drift)
+    vol_fwd   = np.full(args.forecast, last_vol) * (args.vol_multiplier or 1.0)
+    bb_fwd    = start_price * np.cumprod(1 + drift_fwd)
 
     # ── estimator ──
     ESTIMATOR_LB = 500
@@ -586,17 +590,33 @@ def main():
     base_params = estimator.fit(estimate_df, symbol=args.symbol)
     params_fwd  = build_params_from_theta(theta, base_params)
 
+    # v11: 保留 estimator 算出的 momentum_bias 與 node_breakout_state
+    #      只更新 last_close，不再強制歸零動能狀態
     import dataclasses
     params_fwd = dataclasses.replace(
         params_fwd,
         last_close=start_price,
-        momentum_bias=0.0,
-        node_breakout_state=0,
+        # momentum_bias 與 node_breakout_state 保持 estimator 原值
     )
+    momentum_bias   = float(getattr(params_fwd, "momentum_bias",       0.0))
+    breakout_state  = int(getattr(params_fwd,   "node_breakout_state", 0))
+
+    if args.verbose:
+        print_diagnostics(
+            args, calib_info, model_predicted_params,
+            momentum_bias=momentum_bias,
+            breakout_state=breakout_state,
+            blend_drift=blend_drift,
+            short_drift=short_drift,
+            last_drift=last_drift,
+        )
 
     # ── simulate ──
     end_date_str = end_dt.strftime("%Y-%m-%d")
     print(f"\n[simulate] {args.symbol}  起點={end_date_str}  forecast={args.forecast}  n_paths={args.n_paths}")
+    print(f"  blend_drift={blend_drift*100:+.4f}%/day  "
+          f"(short={short_drift*100:+.4f}%  long={last_drift*100:+.4f}%  w={w})")
+    print(f"  momentum_bias={momentum_bias:+.4f}  breakout_state={breakout_state}")
     print(f"  drift_scale={args.drift_scale}  drift_decay={args.drift_decay}  "
           f"vol_multiplier={args.vol_multiplier}  momentum_boost={args.momentum_boost}")
 
@@ -649,7 +669,7 @@ def main():
 
     # ── 儲存 JSON ──
     model_tag = "+model" if _pm_pipelines is not None else ""
-    mode_tag  = (f"v10-{args.garch_model}(w={args.calib_window}){model_tag}"
+    mode_tag  = (f"v11-{args.garch_model}(w={args.calib_window}){model_tag}"
                  if args.auto_calibrate else "manual")
     out_path  = Path(args.output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -662,15 +682,19 @@ def main():
         "n_paths":        args.n_paths,
         "mode":           mode_tag,
         "params": {
-            "intra_bar":      args.intra_bar,
-            "momentum_boost": args.momentum_boost,
-            "drift_decay":    args.drift_decay,
-            "vol_multiplier": args.vol_multiplier,
-            "drift_scale":    args.drift_scale,
+            "intra_bar":         args.intra_bar,
+            "momentum_boost":    args.momentum_boost,
+            "drift_decay":       args.drift_decay,
+            "vol_multiplier":    args.vol_multiplier,
+            "drift_scale":       args.drift_scale,
+            "blend_drift":       round(blend_drift, 6),
+            "short_drift_weight": w,
         },
-        "auto_calibrate":  args.auto_calibrate,
-        "model_predicted": model_predicted_params,
-        "rep_path":        [round(float(x), 4) for x in rep_close],
+        "momentum_bias":    momentum_bias,
+        "breakout_state":   breakout_state,
+        "auto_calibrate":   args.auto_calibrate,
+        "model_predicted":  model_predicted_params,
+        "rep_path":         [round(float(x), 4) for x in rep_close],
     }
 
     json_path = out_path / f"{args.symbol}_{end_date_str}_{mode_tag}.json"
