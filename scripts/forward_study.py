@@ -1,27 +1,25 @@
 """
-forward_study.py  v11.3  (GJR-GARCH + auto-calibrate + OHLC K線預測)
+forward_study.py  v11.4  (GJR-GARCH + auto-calibrate + OHLC K線預測)
 
-v11.3 新增：
-  1. momentum 翻轉偵測 — 最近 3 根 K 棒連漲且 blend_drift < 0 時，
-     momentum_bias 強制歸零，不讓空頭動能繼續拖住走勢
-  2. 前期快速衰減 — drift 在前 10 根後以 2× 速率衰減，
-     之後恢復正常，讓後半段純靠波動率驅動
+v11.4 新增：
+  支撐/壓力偵測 (price density histogram)
+  - 用近 60~120 根收盤價建直方圖，找成交密集帶作為支撐/壓力位
+  - 若起點距支撐 < 2%  → blend_drift 往多頭方向修正（最大 +0.05%/day）
+  - 若起點距壓力 < 2%  → blend_drift 往空頭方向修正（最大 -0.03%/day）
+  - Verbose 額外顯示 [支撐壓力] 區塊
 
-v11.2 新增：
-  1. blend_drift 動態截斷 — MAX = 0.5 × σ_garch（無 GARCH 時 fallback 到 0.5 × rv）
-     防止 short_drift(5d) 在短暫回調時把 drift 拉爆
+v11.3 已有：
+  1. momentum 翻轉偵測 — 連漲 N 根且 blend_drift < 0 時 momentum_bias 歸零
+  2. 前期快速衰減 — drift 在前 10 根後以 2× 速率衰減
+
+v11.2 已有：
+  blend_drift 動態截斷 MAX = 0.5 × σ_garch
 
 v11.1 已有：
-  1. print_ohlc_comparison() — 每根 K 棒對照表
-  2. 修正實際收盤線消失問題
+  print_ohlc_comparison() — 每根 K 棒對照表
 
 v11 已有：
-  1. momentum_bias + node_breakout_state
-  2. backbone drift = 0.4 × short_drift(5d) + 0.6 × last_drift
-
-v10 已有：
-  1. render_forecast 手繪 K 線
-  2. pick_representative_path 從 SimulationResult 直接讀 OHLC
+  momentum_bias + node_breakout_state
 
 用法：
   python scripts/forward_study.py \\
@@ -91,6 +89,82 @@ def garch_vol_forecast(close_arr, model_type: str = "gjr-garch"):
         return fvol, info
     except Exception as e:
         return None, {"error": str(e)}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 支撐/壓力偵測 (price density histogram)
+# ──────────────────────────────────────────────────────────────────────────────
+def find_support_resistance(
+    close_arr,
+    window: int = 90,
+    n_bins: int = 40,
+    top_k: int = 3,
+):
+    """
+    用近 `window` 根收盤價建直方圖，找成交最密集的 top_k 個價位帶。
+    回傳 (support_levels, resistance_levels) 各為 sorted list，
+    支撐 = 密集帶中低於 start_price 的部分；壓力 = 高於的部分。
+    start_price 由呼叫端傳入後再分類。
+    """
+    prices = close_arr[-window:] if len(close_arr) >= window else close_arr
+    counts, edges = np.histogram(prices, bins=n_bins)
+    bin_centers = 0.5 * (edges[:-1] + edges[1:])
+    top_idx = np.argsort(counts)[::-1][:top_k]
+    dense_levels = sorted(bin_centers[top_idx])
+    return dense_levels
+
+
+def compute_sr_drift_adjustment(
+    close_arr,
+    start_price: float,
+    sr_window: int = 90,
+    n_bins: int = 40,
+    top_k: int = 5,
+    support_zone_pct: float = 0.02,   # 距支撐 <2% 才觸發
+    resist_zone_pct: float = 0.02,    # 距壓力 <2% 才觸發
+    max_support_pull: float = 0.0005, # 最大多頭修正 +0.05%/day
+    max_resist_push: float = 0.0003,  # 最大空頭修正 -0.03%/day
+):
+    """
+    計算支撐/壓力對 blend_drift 的修正量。
+    回傳 (drift_adj, sr_info_dict)
+    """
+    levels = find_support_resistance(close_arr, window=sr_window, n_bins=n_bins, top_k=top_k)
+
+    supports    = [lv for lv in levels if lv < start_price]
+    resistances = [lv for lv in levels if lv > start_price]
+
+    nearest_support  = max(supports)    if supports    else None
+    nearest_resist   = min(resistances) if resistances else None
+
+    drift_adj = 0.0
+    support_pull = 0.0
+    resist_push  = 0.0
+
+    if nearest_support is not None:
+        dist_sup = (start_price - nearest_support) / start_price
+        if 0 < dist_sup < support_zone_pct:
+            # 越接近支撐，修正越大（線性插值）
+            support_pull = (1.0 - dist_sup / support_zone_pct) * max_support_pull
+            drift_adj += support_pull
+
+    if nearest_resist is not None:
+        dist_res = (nearest_resist - start_price) / start_price
+        if 0 < dist_res < resist_zone_pct:
+            # 越接近壓力，修正越大
+            resist_push = (1.0 - dist_res / resist_zone_pct) * max_resist_push
+            drift_adj -= resist_push
+
+    sr_info = {
+        "near_support":  round(nearest_support,  4) if nearest_support  is not None else None,
+        "near_resist":   round(nearest_resist,    4) if nearest_resist   is not None else None,
+        "dist_support":  round((start_price - nearest_support)  / start_price, 4) if nearest_support  is not None else None,
+        "dist_resist":   round((nearest_resist  - start_price)  / start_price, 4) if nearest_resist   is not None else None,
+        "support_pull":  round(support_pull,  6),
+        "resist_push":   round(resist_push,   6),
+        "drift_adj":     round(drift_adj,     6),
+    }
+    return drift_adj, sr_info
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -167,6 +241,15 @@ def parse_args():
                    help="連漲/連跌幾根觸發 momentum 翻轉歸零 (預設 3)")
     p.add_argument("--early-decay-bars", type=int, default=10,
                    help="前 N 根使用 2× drift_decay，之後恢復正常 (預設 10)")
+    # 支撐壓力
+    p.add_argument("--sr-window",      type=int,   default=90,
+                   help="支撐壓力直方圖掃描窗口（根數，預設 90）")
+    p.add_argument("--sr-bins",        type=int,   default=40,
+                   help="直方圖 bin 數（預設 40）")
+    p.add_argument("--sr-top-k",       type=int,   default=5,
+                   help="取前 K 個密集帶（預設 5）")
+    p.add_argument("--no-sr",           action="store_true",
+                   help="停用支撐壓力 drift 修正")
     return p.parse_args()
 
 
@@ -230,9 +313,10 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
                       momentum_bias: float = 0.0, breakout_state: int = 0,
                       blend_drift: float = 0.0, short_drift: float = 0.0,
                       last_drift: float = 0.0, drift_clamp_max: float | None = None,
-                      momentum_reversed: bool = False):
+                      momentum_reversed: bool = False,
+                      sr_info: dict | None = None):
     print("\n" + "─" * 60)
-    print("  VERBOSE DIAGNOSTICS (v11.3)")
+    print("  VERBOSE DIAGNOSTICS (v11.4)")
     print("─" * 60)
     if calib_info:
         gi  = calib_info.get("_garch_info", {})
@@ -262,6 +346,32 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
           + clamp_str)
     if drift_clamp_max:
         print(f"  drift_clamp_max : ±{drift_clamp_max*100:.4f}%/day  (0.5×σ_garch)")
+
+    # ── 支撐壓力區塊 ──
+    if sr_info is not None:
+        print(f"\n  [支撐壓力]")
+        ns = sr_info.get("near_support")
+        nr = sr_info.get("near_resist")
+        sp = sr_info.get("support_pull", 0.0)
+        rp = sr_info.get("resist_push",  0.0)
+        da = sr_info.get("drift_adj",    0.0)
+        if ns is not None:
+            dist_s = sr_info.get("dist_support", 0.0)
+            pull_str = f"→ drift +{sp*100:.4f}%/day" if sp > 0 else "(距離 > 2%，無修正)"
+            print(f"  near_support  : {ns:.2f}  (距起點 -{dist_s*100:.2f}%)  {pull_str}")
+        else:
+            print(f"  near_support  : 無（近期無低於起點的密集帶）")
+        if nr is not None:
+            dist_r = sr_info.get("dist_resist", 0.0)
+            push_str = f"→ drift -{rp*100:.4f}%/day" if rp > 0 else "(距離 > 2%，無修正)"
+            print(f"  near_resist   : {nr:.2f}  (距起點 +{dist_r*100:.2f}%)  {push_str}")
+        else:
+            print(f"  near_resist   : 無（近期無高於起點的密集帶）")
+        if abs(da) > 1e-9:
+            print(f"  ✅ SR drift 修正 : {da*100:+.4f}%/day  (已加入 blend_drift)")
+        else:
+            print(f"  SR drift 修正 : 0（起點不在任何支撐/壓力帶附近）")
+
     print(f"\n  [前期快速衰減]")
     print(f"  early_decay_bars: {args.early_decay_bars} 根  (2×drift_decay → 正常)")
     print(f"\n  [最終模擬參數]")
@@ -395,6 +505,7 @@ def render_forecast(
     rep_close, ohlc,
     actual_close=None,
     actual_ohlc: dict | None = None,
+    sr_info: dict | None = None,
 ):
     fig, ax = plt.subplots(figsize=(15, 6))
 
@@ -427,6 +538,18 @@ def render_forecast(
 
     bull_patch = mpatches.Patch(color="#26A69A", label="預測漲K")
     bear_patch = mpatches.Patch(color="#EF5350", label="預測跌K")
+
+    # 畫支撐/壓力水平線
+    if sr_info is not None:
+        ns = sr_info.get("near_support")
+        nr = sr_info.get("near_resist")
+        x_range = np.arange(-len(hist_close), forecast)
+        if ns is not None:
+            ax.axhline(ns, color="#FF8F00", lw=0.8, ls="--", alpha=0.7,
+                       label=f"支撐 {ns:.2f}")
+        if nr is not None:
+            ax.axhline(nr, color="#AB47BC", lw=0.8, ls="--", alpha=0.7,
+                       label=f"壓力 {nr:.2f}")
 
     _actual_c = None
     if actual_ohlc is not None and "close" in actual_ohlc:
@@ -638,7 +761,7 @@ def main():
     if args.auto_calibrate:
         calib_window = args.calib_window
         model_label  = args.garch_model if use_garch else "rv"
-        print(f"\n[auto-calibrate v11.3] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
+        print(f"\n[auto-calibrate v11.4] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             df.iloc[:train_end_idx]["Close"].values.astype(float),
             theta,
@@ -654,7 +777,6 @@ def main():
         if args.drift_decay    is None: args.drift_decay    = calib["drift_decay"]
         if args.vol_multiplier is None: args.vol_multiplier = calib["vol_multiplier"]
         if args.drift_scale    is None: args.drift_scale    = calib["drift_scale"]
-        # drift clamp：手動 > 動態計算
         if args.drift_clamp is None:
             args.drift_clamp = calib["drift_clamp_max"]
     else:
@@ -697,13 +819,30 @@ def main():
     blend_drift  = w * short_drift + (1.0 - w) * last_drift
 
     # ── v11.2：動態截斷 blend_drift ──
-    drift_clamp_max = args.drift_clamp  # 已在 auto_calibrate 或手動設定
+    drift_clamp_max = args.drift_clamp
     if drift_clamp_max is not None and drift_clamp_max > 0:
         blend_drift_raw = blend_drift
         blend_drift = float(np.clip(blend_drift, -drift_clamp_max, drift_clamp_max))
         if abs(blend_drift_raw - blend_drift) > 1e-8:
             print(f"  [drift clamp] {blend_drift_raw*100:+.4f}%/day → {blend_drift*100:+.4f}%/day  "
                   f"(MAX=±{drift_clamp_max*100:.4f}%/day)")
+
+    # ── v11.4：支撐壓力修正 blend_drift ──
+    sr_info: dict | None = None
+    if not args.no_sr:
+        sr_close_arr = df.iloc[:train_end_idx]["Close"].values.astype(float)
+        drift_adj, sr_info = compute_sr_drift_adjustment(
+            sr_close_arr,
+            start_price=start_price,
+            sr_window=args.sr_window,
+            n_bins=args.sr_bins,
+            top_k=args.sr_top_k,
+        )
+        if abs(drift_adj) > 1e-9:
+            blend_drift += drift_adj
+            # 修正後再 clamp 一次，防止修正後超出上限
+            if drift_clamp_max is not None and drift_clamp_max > 0:
+                blend_drift = float(np.clip(blend_drift, -drift_clamp_max, drift_clamp_max))
 
     drift_fwd = np.full(args.forecast, blend_drift)
     vol_fwd   = np.full(args.forecast, last_vol) * (args.vol_multiplier or 1.0)
@@ -729,7 +868,6 @@ def main():
     breakout_state  = int(getattr(params_fwd,   "node_breakout_state", 0))
 
     # ── v11.3：momentum 翻轉偵測 ──
-    # 最近 reversal_window 根連漲 且 blend_drift < 0 → momentum_bias 歸零
     momentum_reversed = False
     reversal_win = max(1, args.reversal_window)
     if blend_drift < 0 and len(log_ret_hist) >= reversal_win:
@@ -739,12 +877,10 @@ def main():
             momentum_reversed = True
 
     # ── v11.3：前期快速衰減 drift schedule ──
-    # 前 early_decay_bars 根使用 2× drift_decay，之後恢復原速
     early_bars  = max(0, args.early_decay_bars)
     base_decay  = float(args.drift_decay or 0.04)
     fast_decay  = min(base_decay * 2.0, 0.99)
 
-    # 重建 drift schedule（逐根衰減）
     drift_schedule = np.empty(args.forecast)
     current_drift  = blend_drift
     for t in range(args.forecast):
@@ -762,6 +898,7 @@ def main():
             last_drift=last_drift,
             drift_clamp_max=drift_clamp_max,
             momentum_reversed=momentum_reversed,
+            sr_info=sr_info,
         )
 
     # ── simulate ──
@@ -769,6 +906,9 @@ def main():
     print(f"\n[simulate] {args.symbol}  起點={end_date_str}  forecast={args.forecast}  n_paths={args.n_paths}")
     print(f"  blend_drift={blend_drift*100:+.4f}%/day  "
           f"(short={short_drift*100:+.4f}%  long={last_drift*100:+.4f}%  w={w})")
+    if sr_info and abs(sr_info.get("drift_adj", 0.0)) > 1e-9:
+        print(f"  SR adj={sr_info['drift_adj']*100:+.4f}%/day  "
+              f"(support={sr_info.get('near_support')}  resist={sr_info.get('near_resist')})")
     print(f"  momentum_bias={momentum_bias:+.4f}  breakout_state={breakout_state}"
           + ("  [翻轉歸零]" if momentum_reversed else ""))
     print(f"  drift_scale={args.drift_scale}  drift_decay={base_decay}(fast={fast_decay:.4f} ×{early_bars}bars)  "
@@ -857,6 +997,7 @@ def main():
         "breakout_state":     breakout_state,
         "auto_calibrate":     args.auto_calibrate,
         "model_predicted":    model_predicted_params,
+        "sr_info":            sr_info,
         "rep_path":           [round(float(x), 4) for x in rep_close],
     }
 
@@ -877,6 +1018,7 @@ def main():
         ohlc=ohlc,
         actual_close=actual_close,
         actual_ohlc=actual_ohlc,
+        sr_info=sr_info,
     )
     print(f"✔ 完成")
 
