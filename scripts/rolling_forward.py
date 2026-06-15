@@ -1,12 +1,12 @@
 """
-rolling_forward.py  (v2 - Medoid + P10/P90 + Coverage + Agent Layer)
+rolling_forward.py  (v3 - Medoid + P10/P90 + Coverage + Agent Layer + VIX hookup)
 
 核心流程
 --------
 每「輪」只預測 N 根（預設 5），然後把真實 N 根接在歷史尾端，
 再重新校準 + 預測下一輪。
 
-新增功能（v2）
+新增功能（v3）
 --------------
 1. Medoid 路徑選取：模擬 n_paths 條路徑，選出和其他所有路徑
    Euclidean 距離總和最小的那條（保留波動、轉折，不平滑化）。
@@ -14,6 +14,16 @@ rolling_forward.py  (v2 - Medoid + P10/P90 + Coverage + Agent Layer)
 3. 覆蓋率評估：實際走勢落在 P10–P90 的比例，目標 ≈ 80%。
 4. 代理人行為層：載入 agent_profile.json，調整 momentum_boost
    和 mr_coeff，讓模擬反映散戶/大戶行為特徵。
+5. VIX 接入：每輪從 cache/macro.parquet 讀取對應時間點 VIX，
+   傳入 apply_agent_profile 做恐慌修正。
+6. Hurst 防呆：inst_mr_strength clamp 到 [0.1, 1.0]，避免
+   pure-trend 股票把 mr_coeff 壓到下界。
+
+修復（v3）
+----------
+- Bug fix: SimulationResult 的多路徑屬性是 future_paths，不是
+  paths/close_paths/all_paths。之前 fallback 導致 P10=P90=medoid，
+  覆蓋率永遠 0%。現在直接用 result.future_paths[:, :step]。
 
 方向命中定義（v2）
 ------------------
@@ -75,6 +85,46 @@ except ImportError:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# VIX 查詢輔助（v3 新增）
+# ──────────────────────────────────────────────────────────────────────────────
+def _load_vix_series(cache_dir: str | None = None) -> pd.Series | None:
+    """
+    從 cache/macro.parquet 讀取 VIX 序列。
+    回傳 pd.Series(index=DatetimeIndex, values=float) 或 None。
+    """
+    if cache_dir is None:
+        # 預設相對路徑：scripts/ 的上層 / cache
+        cache_dir = str(Path(__file__).parent.parent / "cache")
+    macro_path = Path(cache_dir) / "macro.parquet"
+    if not macro_path.exists():
+        return None
+    try:
+        df = pd.read_parquet(macro_path)
+        # 欄位可能是 'VIX' 或 '^VIX'
+        for col in ["VIX", "^VIX", "vix"]:
+            if col in df.columns:
+                s = df[col].dropna()
+                s.index = pd.to_datetime(s.index)
+                return s
+        return None
+    except Exception:
+        return None
+
+
+def _get_vix_at(vix_series: pd.Series | None, date: pd.Timestamp) -> float | None:
+    """
+    取 date 當天或之前最近一個 VIX 值。
+    找不到時回傳 None。
+    """
+    if vix_series is None or len(vix_series) == 0:
+        return None
+    candidates = vix_series[vix_series.index <= date]
+    if len(candidates) == 0:
+        return None
+    return float(candidates.iloc[-1])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 代理人行為層
 # ──────────────────────────────────────────────────────────────────────────────
 def load_agent_profile(path: str | None) -> dict | None:
@@ -106,15 +156,20 @@ def apply_agent_profile(
     散戶動能強 → momentum_boost 上調
     大戶均值回歸強 → mr_coeff 上調
     恐慌靈敏度高 + VIX 高 → momentum_boost 下調（拋售壓制動能）
+
+    v3 fix: inst_mr_strength clamp 到 [0.1, 1.0]，避免 H≈1 的股票
+    把 mr_coeff 壓到下界導致均值回歸力消失。
     """
     if profile is None:
         return base_momentum_boost, base_mr_coeff
 
     retail_mom  = float(profile.get("retail_momentum_strength",  0.5))
     panic_sens  = float(profile.get("retail_panic_sensitivity",  0.3))
-    inst_mr     = float(profile.get("inst_mr_strength",          0.5))
+    # v3: clamp inst_mr_strength，pure-trend (H≈1) 時仍保留最低 0.1
+    inst_mr_raw = float(profile.get("inst_mr_strength", 0.5))
+    inst_mr     = float(np.clip(inst_mr_raw, 0.1, 1.0))
     vix_cal     = float(profile.get("vix_level") or 20.0)
-    vix_ref     = vix_now if vix_now else vix_cal
+    vix_ref     = vix_now if vix_now is not None else vix_cal
 
     # 散戶動能：0.5 為中性，>0.5 上調 momentum_boost
     mom_adj = (retail_mom - 0.5) * 0.6   # 最多 ±0.3
@@ -124,8 +179,8 @@ def apply_agent_profile(
 
     new_momentum_boost = float(np.clip(base_momentum_boost + mom_adj + panic_adj, 0.3, 2.5))
 
-    # 大戶 MR：inst_mr_strength > 0.5 增強回歸力
-    mr_adj = (inst_mr - 0.5) * 0.04   # 最多 ±0.02
+    # 大戶 MR：inst_mr > 0.5 增強回歸力（clamp 後不會因 0.0 變成負調整）
+    mr_adj = (inst_mr - 0.5) * 0.04   # 最多 ±0.02（clamp 後最少 -0.016）
     new_mr_coeff = float(np.clip(base_mr_coeff + mr_adj, 0.01, 0.20))
 
     return new_momentum_boost, new_mr_coeff
@@ -151,7 +206,6 @@ def select_medoid_path(all_paths: np.ndarray) -> tuple[int, np.ndarray]:
     if n > 200:
         idx_sample = np.random.choice(n, 200, replace=False)
         subset = all_paths[idx_sample]
-        # pairwise distances in subset
         diff = subset[:, np.newaxis, :] - subset[np.newaxis, :, :]
         dist_matrix = np.sqrt(np.sum(diff ** 2, axis=-1))
         dist_sums = dist_matrix.sum(axis=1)
@@ -353,6 +407,8 @@ def _run_one_step(
     full_df_up_to_now: pd.DataFrame,
     param_model_payload=None,
     agent_profile: dict | None = None,
+    vix_series: pd.Series | None = None,
+    cutoff_date: pd.Timestamp | None = None,
 ) -> tuple[np.ndarray, dict | None, np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns:
@@ -361,6 +417,10 @@ def _run_one_step(
         all_closes  : 所有路徑收盤 (n_paths, step)
         p10         : P10 per bar   (step,)
         p90         : P90 per bar   (step,)
+
+    v3 changes:
+        - vix_series / cutoff_date 參數用於查詢當輪 VIX
+        - result.future_paths 直接用（修復 P10/P90 = 0% 的 bug）
     """
     step = args.step
 
@@ -389,13 +449,15 @@ def _run_one_step(
     drift_scale     = calib["drift_scale"]
     drift_clamp_max = calib["drift_clamp_max"]
 
-    # ── 代理人行為調整 ──────────────────────────────────────
+    # ── 代理人行為調整（v3：傳入實際 VIX）──────────────────
     base_mr = theta.mr_coeff
+    # v3: 查詢對應時間點的 VIX
+    vix_now = _get_vix_at(vix_series, cutoff_date) if cutoff_date is not None else None
     momentum_boost, base_mr = apply_agent_profile(
         agent_profile,
         momentum_boost,
         base_mr,
-        vix_now=None,
+        vix_now=vix_now,
     )
     # ────────────────────────────────────────────────────────
 
@@ -494,30 +556,11 @@ def _run_one_step(
     )
     result = sim.simulate()
 
-    # ── 收集所有路徑的收盤價 ────────────────────────────────
-    # result.paths shape: (n_paths, n_steps, 4) 或類似
-    # 嘗試多種可能的屬性名稱
-    all_closes = None
-    for attr in ["paths", "close_paths", "all_paths"]:
-        if hasattr(result, attr):
-            arr = getattr(result, attr)
-            if isinstance(arr, np.ndarray) and arr.ndim >= 2:
-                # 取最後一個維度若 ndim==3，否則直接用
-                all_closes = arr[:, :step, -1] if arr.ndim == 3 else arr[:, :step]
-                break
-
-    if all_closes is None or len(all_closes) == 0:
-        # fallback：用 pick_representative_path 取單條
-        rep_close, ohlc = pick_representative_path(result)
-        if len(rep_close) == 0:
-            rep_close = np.full(step, start_price)
-            ohlc = None
-        rep_close = rep_close[:step]
-        p10 = rep_close.copy()
-        p90 = rep_close.copy()
-        if ohlc is not None:
-            ohlc = {k: v[:step] for k, v in ohlc.items()}
-        return rep_close, ohlc, rep_close[np.newaxis, :], p10, p90
+    # ── v3 fix: 直接用 result.future_paths（shape: n_paths x n_steps）──
+    # 之前程式碼尋找 'paths'/'close_paths'/'all_paths' 屬性，
+    # 但 SimulationResult 只有 future_paths，導致 all_closes 永遠是 None，
+    # P10/P90 fallback 成 medoid，覆蓋率永遠 0%。
+    all_closes = result.future_paths[:, :step]   # (n_paths, step)
 
     # ── Medoid 選取 ─────────────────────────────────────────
     medoid_idx, medoid_close = select_medoid_path(all_closes)
@@ -527,12 +570,11 @@ def _run_one_step(
     p10 = p10[:step]
     p90 = p90[:step]
 
-    # 從模擬結果中取 medoid 路徑的 OHLC
+    # 從模擬結果中取 representative path 的 OHLC，用 medoid close 覆蓋
     ohlc = None
     rep_close, rep_ohlc = pick_representative_path(result)
     if rep_ohlc is not None:
         ohlc = {k: v[:step] for k, v in rep_ohlc.items()}
-        # 用 medoid close 覆蓋
         ohlc["close"] = medoid_close
 
     return medoid_close, ohlc, all_closes, p10, p90
@@ -549,6 +591,7 @@ def rolling_forward(
     actual_future_df: pd.DataFrame | None = None,
     param_model_payload=None,
     agent_profile: dict | None = None,
+    vix_series: pd.Series | None = None,
 ) -> dict:
     step       = args.step
     total_bars = args.total_bars
@@ -566,6 +609,14 @@ def rolling_forward(
 
     actual_prev_closes: list[float] = []
 
+    # 取得 df 的日期序列，用於查 VIX
+    if "Date" in df.columns:
+        df_dates = pd.to_datetime(df["Date"])
+    elif "Datetime" in df.columns:
+        df_dates = pd.to_datetime(df["Datetime"])
+    else:
+        df_dates = pd.to_datetime(df.index)
+
     for rnd in range(rounds):
         need = min(step, total_bars - bars_done)
         if need <= 0:
@@ -581,10 +632,15 @@ def rolling_forward(
         start_price = float(close_hist[-1])
         print(f"  [輪 {rnd+1}/{rounds}]  訓練截至 idx={cur_end-1}  起點={start_price:.2f}  預測 {need} 根")
 
+        # v3: 取本輪訓練截止日，用於查詢 VIX
+        cutoff_date = df_dates.iloc[cur_end - 1] if cur_end - 1 < len(df_dates) else None
+
         med, ohlc, all_c, p10, p90 = _run_one_step(
             close_hist, theta, args, full_window,
             param_model_payload=param_model_payload,
             agent_profile=agent_profile,
+            vix_series=vix_series,
+            cutoff_date=cutoff_date,
         )
         med  = med[:need]
         p10  = p10[:need]
@@ -907,6 +963,8 @@ def parse_args():
     p.add_argument("--param-model",         default=None)
     p.add_argument("--agent-profile",       default=None,
                    help="agent_profile.json 路徑，提供散戶/大戶行為參數")
+    p.add_argument("--cache-dir",           default=None,
+                   help="macro.parquet 所在目錄（預設自動偵測 cache/）")
     p.add_argument("--output-dir",          default="results")
     p.add_argument("--verbose",             action="store_true")
     p.add_argument("--short-drift-weight",  type=float, default=0.4)
@@ -938,6 +996,13 @@ def main():
     param_model_payload = load_param_model(getattr(args, "param_model", None))
     agent_profile       = load_agent_profile(getattr(args, "agent_profile", None))
     label_suffix = "agent+medoid" if agent_profile is not None else "medoid"
+
+    # v3: 載入 VIX 序列（找不到 macro.parquet 時靜默略過）
+    vix_series = _load_vix_series(cache_dir=getattr(args, "cache_dir", None))
+    if vix_series is not None:
+        print(f"[vix] 載入 {len(vix_series)} 根 VIX  ({vix_series.index[0].date()} ~ {vix_series.index[-1].date()})")
+    else:
+        print("[vix] macro.parquet 未找到，VIX 恐慌修正停用")
 
     end_dt   = pd.Timestamp(args.end_date) if args.end_date else pd.Timestamp.today()
     start_dt = end_dt - pd.DateOffset(years=3)
@@ -986,6 +1051,7 @@ def main():
         actual_future_df=actual_future_df,
         param_model_payload=param_model_payload,
         agent_profile=agent_profile,
+        vix_series=vix_series,
     )
 
     print_rolling_comparison(
