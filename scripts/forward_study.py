@@ -4,8 +4,8 @@ forward_study.py  v9  (GJR-GARCH + auto-calibrate)
 v9 修正：
   1. 傳送 median_path 到 render_forecast（修正 KeyError 'median_path'）
   2. render_forecast 接收 median_path 參數
-  3. --param-model 旗標：載入 XGBoost 模型預測 drift_scale / drift_decay，
-     自動預測 drift_scale / drift_decay，取代 auto-calibrate 的對應值。
+  3. --param-model 旗標：joblib 載入的是 dict{models/feature_cols/targets}，
+     正確解開後逐 target 呼叫各自 Pipeline.predict()
   4. 移除 auto-calibrate 區塊的重複 inline print（由 print_diagnostics 統一輸出）
 
 用法：
@@ -74,7 +74,7 @@ def garch_vol_forecast(close_arr, model_type: str = "gjr-garch"):
         persistence = alpha + beta + 0.5 * gamma
 
         fc   = res.forecast(horizon=1, reindex=False)
-        fvol = float(np.sqrt(fc.variance.values[-1, 0])) / 100   # daily vol (fraction)
+        fvol = float(np.sqrt(fc.variance.values[-1, 0])) / 100
 
         info = {
             "alpha": round(alpha, 4),
@@ -120,8 +120,7 @@ def parse_args():
     p.add_argument("--garch-model",   default="gjr-garch",
                    choices=["gjr-garch", "garch"])
     p.add_argument("--param-model",   default=None,
-                   help="joblib 模型路徑；若提供，用模型預測 drift_scale / "
-                        "覆蓋 auto-calibrate 的對應值。")
+                   help="joblib 模型路徑；若提供，用模型預測 drift_scale/drift_decay 覆蓋 auto-calibrate。")
     p.add_argument("--output-dir",    default="results")
     p.add_argument("--verbose",       action="store_true")
     return p.parse_args()
@@ -137,18 +136,10 @@ def auto_calibrate(
     use_garch: bool = True,
     garch_model: str = "gjr-garch",
 ):
-    """
-    根據近期 K 棒自動設定模擬參數。
-    回傳 dict，含 intra_bar / shadow_noise / shadow_clamp /
-    momentum_boost / drift_decay / vol_multiplier / drift_scale
-    以及隱藏欄位 _vol_source / _avg_body_pct / _garch_info。
-    """
     c = close_arr[-calib_window:] if len(close_arr) > calib_window else close_arr
-
     log_rets = np.diff(np.log(c))
     rv = float(np.std(log_rets))
 
-    # 波動率來源
     garch_vol, garch_info = None, {}
     vol_source = "rv"
     if use_garch and _ARCH_AVAILABLE:
@@ -159,17 +150,12 @@ def auto_calibrate(
     base_vol = garch_vol if vol_source == "garch" else rv
     vol_multiplier = float(np.clip(base_vol / max(theta.vol, 1e-8), 0.5, 3.0))
 
-    # 平均 body 大小
-    o_arr = None   # 沒有 open 就只用 close
     body_pct = np.abs(np.diff(c)) / (c[:-1] + 1e-8)
     avg_body = float(np.mean(body_pct))
     intra_bar = 3 if avg_body > 0.012 else 2
 
-    # shadow noise
     shadow_noise = float(np.clip(rv * 4.0, 0.08, 0.30))
     shadow_clamp = 2.5 if rv > 0.018 else 2.0
-
-    # momentum & drift
     momentum_boost = 0.8
     drift_decay = float(np.clip(0.02 + rv * 1.5, 0.03, 0.15))
     drift_scale = float(np.clip(rv / max(theta.vol, 1e-8), 0.4, 3.0))
@@ -182,7 +168,6 @@ def auto_calibrate(
         "drift_decay":    round(drift_decay, 4),
         "vol_multiplier": round(vol_multiplier, 4),
         "drift_scale":    round(drift_scale, 4),
-        # 隱藏欄位
         "_vol_source":    vol_source,
         "_avg_body_pct":  round(avg_body * 100, 3),
         "_garch_info":    garch_info,
@@ -221,8 +206,8 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
 
     if model_predicted_params:
         print(f"\n  [param-model 覆蓋]")
-        print(f"  drift_scale   : {model_predicted_params.get('drift_scale', 'N/A')}  ← 模型預測（已覆蓋 auto-calibrate）")
-        print(f"  drift_decay   : {model_predicted_params.get('drift_decay', 'N/A')}  ← 模型預測（已覆蓋 auto-calibrate）")
+        print(f"  drift_scale   : {model_predicted_params.get('drift_scale', 'N/A')}  ← 模型預測")
+        print(f"  drift_decay   : {model_predicted_params.get('drift_decay', 'N/A')}  ← 模型預測")
 
     print("─" * 60 + "\n")
 
@@ -236,12 +221,9 @@ def render_forecast(
     actual_close=None,
 ):
     fig, ax = plt.subplots(figsize=(14, 6))
-
-    # 歷史
     hist_x = np.arange(-len(hist_close), 0)
     ax.plot(hist_x, hist_close, color="#555555", lw=1.2, label="歷史收盤")
 
-    # 信賴帶
     fwd_x = np.arange(0, forecast)
     if hasattr(result, "percentile_bands") and result.percentile_bands:
         bands = result.percentile_bands
@@ -256,11 +238,9 @@ def render_forecast(
             ax.fill_between(fwd_x, p25[:forecast], p75[:forecast],
                             alpha=0.25, color="#2196F3", label="P25-P75")
 
-    # 中位數路徑
     mp = median_path[:forecast]
     ax.plot(fwd_x[:len(mp)], mp, color="#E53935", lw=2, label="中位數預測")
 
-    # 實際（若有）
     if actual_close is not None and len(actual_close) > 0:
         n = min(len(actual_close), forecast)
         ax.plot(fwd_x[:n], actual_close[:n],
@@ -329,27 +309,26 @@ def extract_features_for_model(df_window, theta_vol):
         bb_vol_std    = 0.0
 
     feat = {
-        "feat_vol_20":          round(vol_20 * 100, 4),
-        "feat_vol_60":          round(vol_60 * 100, 4),
-        "feat_vol_all":         round(vol_all * 100, 4),
-        "feat_vol_ratio_20_60": round(vol_20 / (vol_60 + 1e-8), 4),
+        "feat_vol_20":             round(vol_20 * 100, 4),
+        "feat_vol_60":             round(vol_60 * 100, 4),
+        "feat_vol_all":            round(vol_all * 100, 4),
+        "feat_vol_ratio_20_60":    round(vol_20 / (vol_60 + 1e-8), 4),
         "feat_vol_ratio_rv_theta": round(vol_20 / (theta_vol + 1e-8), 4),
-        "feat_drift_20":        round(drift_20 * 100, 4),
-        "feat_drift_60":        round(drift_60 * 100, 4),
-        "feat_drift_all":       round(drift_all * 100, 4),
+        "feat_drift_20":           round(drift_20 * 100, 4),
+        "feat_drift_60":           round(drift_60 * 100, 4),
+        "feat_drift_all":          round(drift_all * 100, 4),
         "feat_drift_ratio_20_all": round(drift_20 / (abs(drift_all) + 1e-8) * np.sign(drift_all + 1e-12), 4),
-        "feat_ret_autocorr":    round(ret_autocorr, 4),
-        "feat_vol_autocorr":    round(vol_autocorr, 4),
-        "feat_avg_body_pct":    round(avg_body * 100, 4),
-        "feat_median_sr":       round(median_sr, 4),
-        "feat_p90_sr":          round(p90_sr, 4),
-        "feat_bb_last_drift":   round(bb_last_drift * 100, 4),
-        "feat_bb_last_vol":     round(bb_last_vol * 100, 4),
-        "feat_bb_drift_std":    round(bb_drift_std * 100, 4),
-        "feat_bb_vol_std":      round(bb_vol_std * 100, 4),
+        "feat_ret_autocorr":       round(ret_autocorr, 4),
+        "feat_vol_autocorr":       round(vol_autocorr, 4),
+        "feat_avg_body_pct":       round(avg_body * 100, 4),
+        "feat_median_sr":          round(median_sr, 4),
+        "feat_p90_sr":             round(p90_sr, 4),
+        "feat_bb_last_drift":      round(bb_last_drift * 100, 4),
+        "feat_bb_last_vol":        round(bb_last_vol * 100, 4),
+        "feat_bb_drift_std":       round(bb_drift_std * 100, 4),
+        "feat_bb_vol_std":         round(bb_vol_std * 100, 4),
     }
 
-    # GARCH features
     if _ARCH_AVAILABLE:
         try:
             rets = pd.Series(np.diff(np.log(c)) * 100).dropna()
@@ -384,19 +363,38 @@ def main():
     with open(args.theta) as f:
         theta = CalibratedTheta.from_dict(json.load(f))
 
-    # 載入 param-model（若有）
-    param_model = None
-    param_meta  = None
+    # ── 載入 param-model（若有）──
+    # train_param_model.py 儲存的格式：
+    #   { "models": {target: Pipeline}, "feature_cols": [...], "targets": [...], ... }
+    _pm_pipelines   = None   # dict[target_name -> Pipeline]
+    _pm_feat_cols   = []     # 訓練時的特徵欄位（有序）
+    _pm_target_names = []    # 目標欄位名稱列表
+    param_meta = None
+
     if args.param_model:
         import joblib
-        param_model = joblib.load(args.param_model)
+        _payload = joblib.load(args.param_model)
+        if isinstance(_payload, dict) and "models" in _payload:
+            _pm_pipelines    = _payload["models"]
+            _pm_feat_cols    = _payload.get("feature_cols", [])
+            _pm_target_names = _payload.get("targets", [])
+        else:
+            # 舊格式：直接是模型物件（不支援，報錯提示）
+            raise ValueError(
+                "param_model 格式不符：預期 dict{'models':..., 'feature_cols':...}，"
+                f"實際為 {type(_payload)}。請用最新 train_param_model.py 重新訓練。"
+            )
         meta_path = Path(args.param_model).with_suffix(".meta.json")
         if meta_path.exists():
             with open(meta_path) as f:
                 param_meta = json.load(f)
+            _pm_feat_cols    = param_meta.get("feature_cols", _pm_feat_cols)
+            _pm_target_names = param_meta.get("targets",      _pm_target_names)
         print(f"[param-model] 已載入 {args.param_model}")
+        print(f"  targets: {_pm_target_names}")
+        print(f"  features: {len(_pm_feat_cols)} 個")
 
-    # 下載資料
+    # ── 下載資料 ──
     end_dt   = pd.Timestamp(args.end_date) if args.end_date else pd.Timestamp.today()
     start_dt = end_dt - pd.DateOffset(years=3)
     dl_end   = end_dt + pd.DateOffset(days=args.forecast * 2 + 10)
@@ -467,26 +465,20 @@ def main():
         if args.drift_scale    is None: args.drift_scale    = 1.18
 
     # ── param-model 覆蓋 drift_scale / drift_decay ──
-    if param_model is not None:
+    if _pm_pipelines is not None:
         calib_window_fm = args.calib_window
         feat_df = df.iloc[train_end_idx - calib_window_fm: train_end_idx]
-        feats = extract_features_for_model(feat_df, theta.vol)
+        feats   = extract_features_for_model(feat_df, theta.vol)
 
-        # 確保特徵順序與訓練時一致
-        if param_meta and "feature_names" in param_meta:
-            feat_vec = np.array([[feats.get(k, 0.0) for k in param_meta["feature_names"]]])
-        else:
-            feat_vec = np.array([list(feats.values())])
+        # 特徵向量（嚴格按訓練時欄位順序）
+        feat_cols = _pm_feat_cols if _pm_feat_cols else list(feats.keys())
+        feat_vec  = np.array([[feats.get(k, 0.0) for k in feat_cols]])
 
-        preds = param_model.predict(feat_vec)
-        # preds shape: (1, n_targets) or (n_targets,)
-        preds_flat = np.array(preds).flatten()
-
-        target_names = param_meta.get("target_names", []) if param_meta else []
         model_predicted_params = {}
-        for i, tname in enumerate(target_names):
-            if i < len(preds_flat):
-                model_predicted_params[tname.replace("target_", "")] = round(float(preds_flat[i]), 4)
+        for tname, pipe in _pm_pipelines.items():
+            pred = float(pipe.predict(feat_vec)[0])
+            short = tname.replace("target_", "")
+            model_predicted_params[short] = round(pred, 4)
 
         if "drift_scale" in model_predicted_params:
             args.drift_scale = model_predicted_params["drift_scale"]
@@ -557,7 +549,7 @@ def main():
     )
     result = sim.simulate()
 
-    # median_path
+    # ── median_path ──
     if hasattr(result, "median_path") and result.median_path is not None:
         median_path = result.median_path
     elif hasattr(result, "percentile_bands") and result.percentile_bands:
@@ -567,19 +559,17 @@ def main():
             median_path = p50
         else:
             keys = sorted(bands.keys())
-            mid = keys[len(keys) // 2]
-            median_path = bands[mid]
+            median_path = bands[keys[len(keys) // 2]]
     else:
-        # fallback: mean of all paths
         if hasattr(result, "paths") and result.paths is not None:
             median_path = np.median(result.paths, axis=0)
         else:
             median_path = np.full(args.forecast, start_price)
 
-    # ── print summary ──
+    # ── summary ──
     n = min(len(median_path), args.forecast)
-    final_pred  = float(median_path[n - 1])
-    total_ret   = (final_pred - start_price) / start_price * 100
+    final_pred = float(median_path[n - 1])
+    total_ret  = (final_pred - start_price) / start_price * 100
     print(f"\n  起點價格 : {start_price:.2f}")
     print(f"  預測終點 : {final_pred:.2f}  ({total_ret:+.1f}%  {n}日)")
 
@@ -590,10 +580,10 @@ def main():
         print(f"  實際終點 : {actual_close[na-1]:.2f}  ({actual_ret:+.1f}%)")
         print(f"  MAE      : {mae:.2f}%")
 
-    # ── 儲存結果 ──
-    model_tag  = f"+model" if param_model is not None else ""
-    mode_tag   = f"v9.2-{args.garch_model}(w={args.calib_window}){model_tag}" if args.auto_calibrate else "manual"
-    out_path   = Path(args.output_dir)
+    # ── 儲存 ──
+    model_tag = f"+model" if _pm_pipelines is not None else ""
+    mode_tag  = f"v9.2-{args.garch_model}(w={args.calib_window}){model_tag}" if args.auto_calibrate else "manual"
+    out_path  = Path(args.output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     result_dict = {
@@ -612,15 +602,15 @@ def main():
             "vol_multiplier": args.vol_multiplier,
             "drift_scale":    args.drift_scale,
         },
-        "auto_calibrate":   args.auto_calibrate,
-        "model_predicted":  model_predicted_params,
-        "median_path":      [round(float(x), 4) for x in median_path[:args.forecast]],
+        "auto_calibrate":  args.auto_calibrate,
+        "model_predicted": model_predicted_params,
+        "median_path":     [round(float(x), 4) for x in median_path[:args.forecast]],
     }
 
     json_path = out_path / f"{args.symbol}_{end_date_str}_{mode_tag}.json"
     with open(json_path, "w") as f:
         json.dump(result_dict, f, indent=2)
-    print(f"✔ JSON 已儲存 → {json_path}")
+    print(f"\n✔ JSON 已儲存 → {json_path}")
 
     render_forecast(
         symbol=args.symbol,
