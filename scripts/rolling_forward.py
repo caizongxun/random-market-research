@@ -1,5 +1,5 @@
 """
-rolling_forward.py  (v3 - Medoid + P10/P90 + Coverage + Agent Layer + VIX hookup)
+rolling_forward.py  (v3.1 - Medoid + P10/P90 + Coverage + Agent Layer + VIX hookup)
 
 核心流程
 --------
@@ -24,6 +24,12 @@ rolling_forward.py  (v3 - Medoid + P10/P90 + Coverage + Agent Layer + VIX hookup
 - Bug fix: SimulationResult 的多路徑屬性是 future_paths，不是
   paths/close_paths/all_paths。之前 fallback 導致 P10=P90=medoid，
   覆蓋率永遠 0%。現在直接用 result.future_paths[:, :step]。
+
+修復（v3.1）
+-----------
+- Bug fix: _load_vix_series 讀到 tz-aware DatetimeIndex 時
+  _get_vix_at 的 <= 比較會拋 TypeError。
+  現在統一 tz_localize(None) 去除時區，cutoff_date 也同步去除時區。
 
 方向命中定義（v2）
 ------------------
@@ -85,26 +91,32 @@ except ImportError:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# VIX 查詢輔助（v3 新增）
+# VIX 查詢輔助（v3 新增；v3.1 修復 tz-aware index 問題）
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_vix_series(cache_dir: str | None = None) -> pd.Series | None:
     """
     從 cache/macro.parquet 讀取 VIX 序列。
-    回傳 pd.Series(index=DatetimeIndex, values=float) 或 None。
+    回傳 pd.Series(index=DatetimeIndex[tz-naive], values=float) 或 None。
+
+    v3.1: 統一去除 index 時區（tz_localize(None) 或 tz_convert(None)），
+    避免後續與 tz-naive Timestamp 比較時拋 TypeError。
     """
     if cache_dir is None:
-        # 預設相對路徑：scripts/ 的上層 / cache
         cache_dir = str(Path(__file__).parent.parent / "cache")
     macro_path = Path(cache_dir) / "macro.parquet"
     if not macro_path.exists():
         return None
     try:
         df = pd.read_parquet(macro_path)
-        # 欄位可能是 'VIX' 或 '^VIX'
         for col in ["VIX", "^VIX", "vix"]:
             if col in df.columns:
                 s = df[col].dropna()
-                s.index = pd.to_datetime(s.index)
+                idx = pd.to_datetime(s.index)
+                # 統一去除時區
+                if idx.tz is not None:
+                    idx = idx.tz_convert(None)
+                s = s.copy()
+                s.index = idx
                 return s
         return None
     except Exception:
@@ -115,9 +127,14 @@ def _get_vix_at(vix_series: pd.Series | None, date: pd.Timestamp) -> float | Non
     """
     取 date 當天或之前最近一個 VIX 值。
     找不到時回傳 None。
+
+    v3.1: date 強制去除時區，確保與 tz-naive index 可比較。
     """
     if vix_series is None or len(vix_series) == 0:
         return None
+    # 確保 date 是 tz-naive
+    if hasattr(date, 'tz') and date.tz is not None:
+        date = date.tz_localize(None) if date.tz is None else date.tz_convert(None)
     candidates = vix_series[vix_series.index <= date]
     if len(candidates) == 0:
         return None
@@ -192,7 +209,7 @@ def apply_agent_profile(
 def select_medoid_path(all_paths: np.ndarray) -> tuple[int, np.ndarray]:
     """
     從 all_paths (shape: n_paths x n_steps) 選出 medoid。
-    Medoid = 和其他所有路徑 Euclidean 距離總和最小的那條。
+    Medoid = 和其他所有路徑 Euclidean 距離總和最小的那條（保留波動、轉折，不平滑化）。
 
     Returns:
         medoid_idx : int
@@ -421,6 +438,9 @@ def _run_one_step(
     v3 changes:
         - vix_series / cutoff_date 參數用於查詢當輪 VIX
         - result.future_paths 直接用（修復 P10/P90 = 0% 的 bug）
+
+    v3.1:
+        - cutoff_date 去除時區後傳入 _get_vix_at，避免 tz-aware vs tz-naive TypeError
     """
     step = args.step
 
@@ -449,10 +469,15 @@ def _run_one_step(
     drift_scale     = calib["drift_scale"]
     drift_clamp_max = calib["drift_clamp_max"]
 
-    # ── 代理人行為調整（v3：傳入實際 VIX）──────────────────
+    # ── 代理人行為調整（v3.1：cutoff_date 強制 tz-naive）──────────────────
     base_mr = theta.mr_coeff
-    # v3: 查詢對應時間點的 VIX
-    vix_now = _get_vix_at(vix_series, cutoff_date) if cutoff_date is not None else None
+    # 確保 cutoff_date 是 tz-naive
+    safe_cutoff = None
+    if cutoff_date is not None:
+        safe_cutoff = cutoff_date
+        if hasattr(safe_cutoff, 'tz') and safe_cutoff.tz is not None:
+            safe_cutoff = safe_cutoff.tz_convert(None)
+    vix_now = _get_vix_at(vix_series, safe_cutoff) if safe_cutoff is not None else None
     momentum_boost, base_mr = apply_agent_profile(
         agent_profile,
         momentum_boost,
@@ -557,9 +582,6 @@ def _run_one_step(
     result = sim.simulate()
 
     # ── v3 fix: 直接用 result.future_paths（shape: n_paths x n_steps）──
-    # 之前程式碼尋找 'paths'/'close_paths'/'all_paths' 屬性，
-    # 但 SimulationResult 只有 future_paths，導致 all_closes 永遠是 None，
-    # P10/P90 fallback 成 medoid，覆蓋率永遠 0%。
     all_closes = result.future_paths[:, :step]   # (n_paths, step)
 
     # ── Medoid 選取 ─────────────────────────────────────────
@@ -814,7 +836,7 @@ def render_rolling(
             avg_cov = np.mean(coverages)
             cov_colors = ["#66BB6A" if c >= 0.7 else "#FF7043" for c in coverages]
             axes2[1].bar(cov_rounds, [c * 100 for c in coverages],
-                         color=cov_colors, alpha=0.8, width=0.6)
+                         color=cov_colors, alpha=0.8, width=0.6, label="覆蓋率")
             axes2[1].axhline(80, color="#888", lw=1, ls="--", label="目標 80%")
             axes2[1].axhline(avg_cov * 100, color="#42A5F5", lw=1, ls=":",
                              label=f"平均={avg_cov*100:.1f}%")

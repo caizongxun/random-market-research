@@ -107,10 +107,23 @@ def calibrate_inst_mr_strength(
     window: int = 20,
 ) -> float:
     """
-    大戶均值回歸強度：
-    用 Hurst exponent（R/S 法）估計。
-    H < 0.5 → 均值回歸傾向強 → inst_mr_strength 高。
-    H > 0.5 → 趨勢傾向強。
+    大戶均值回歸強度：用 Hurst exponent（R/S 法）估計。
+
+    v2 改進（修復 inst_mr_strength=0.0 異常值）
+    -----------------------------------------------
+    原版只用 3 個等差 split（n/4, n/2, n），n/4 段過短時 R/S 斜率
+    偏高導致 H 估計值≈1.0 → inst_mr_strength≈0.0。
+
+    改動：
+    1. 用 8 個對數等距 split（16 根 ~ n 根），OLS 迴歸點更多、更穩定。
+    2. H clamp 從 [0, 1] 收緊為 [0.3, 0.9]，屏蔽不合理的極端值。
+       - 日線股票合理 Hurst 約 0.45~0.65
+       - H=0.0 → mr=1.0 / H=1.0 → mr=0.0 均屬測量噪音
+    3. 有效 inst_mr_strength 範圍因此落在 [0.1, 0.7]，
+       與 apply_agent_profile 的 clamp(0.1, 1.0) 對齊。
+
+    H < 0.5 → 均值回歸傾向強 → inst_mr_strength 高
+    H > 0.5 → 趨勢傾向強    → inst_mr_strength 低
     回傳 0~1，0.5 為中性。
     """
     log_c = np.log(close)
@@ -118,25 +131,32 @@ def calibrate_inst_mr_strength(
     if n < 40:
         return 0.5
 
-    # 簡單 R/S 估計
-    splits = [n // 4, n // 2, n]
+    # 8 個對數等距 split，最小 16 根
+    min_seg = 16
+    splits = np.unique(
+        np.round(np.geomspace(min_seg, n, num=8)).astype(int)
+    )
+    splits = splits[splits >= min_seg]
+
     rs_vals = []
     for s in splits:
-        seg = log_c[:s]
+        seg = log_c[:int(s)]
         mean = np.mean(seg)
         dev = np.cumsum(seg - mean)
         r = np.max(dev) - np.min(dev)
         std = np.std(seg)
-        if std > 0:
+        if std > 1e-10:
             rs_vals.append((np.log(s), np.log(r / std)))
 
-    if len(rs_vals) < 2:
+    if len(rs_vals) < 3:
         return 0.5
 
     xs = np.array([v[0] for v in rs_vals])
     ys = np.array([v[1] for v in rs_vals])
     H = float(np.polyfit(xs, ys, 1)[0])
-    H = float(np.clip(H, 0.0, 1.0))
+
+    # clamp 到合理範圍 [0.3, 0.9]，屏蔽測量噪音極端值
+    H = float(np.clip(H, 0.3, 0.9))
 
     # H < 0.5 → 回歸強，映射到較高 mr_strength
     mr_strength = float(np.clip(1.0 - H, 0.0, 1.0))
@@ -228,7 +248,7 @@ def calibrate_agent_profile(
     print(f"  散戶動能強度    : {retail_momentum:.3f}")
     print(f"  停損閾值        : {stop_loss_thresh:.3f}%")
     print(f"  恐慌靈敏度      : {panic_sens:.3f}")
-    print(f"  大戶均值回歸強度: {inst_mr:.3f}")
+    print(f"  大戶均值回歸強度: {inst_mr:.3f}  (Hurst→clamp[0.3,0.9]→1-H)")
     print(f"  大戶吸籌比率    : {absorption:.3f}")
     print(f"  出貨壓力區寬度  : {dist_zone:.3f}%")
 
