@@ -42,17 +42,17 @@ from calibrated_simulator import CalibratedTheta, build_params_from_theta
 from us_equity_simulator import USStockFutureSimulator
 
 
-# ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Grid 定義
-# ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 DRIFT_SCALE_GRID    = [0.3, 0.5, 0.8, 1.2, 1.8, 2.5, 3.2]
 MOMENTUM_BOOST_GRID = [0.8, 1.0, 1.3, 1.6, 2.0, 2.5]
 DRIFT_DECAY_GRID    = [0.03, 0.05, 0.07, 0.10, 0.13]
 
 
-# ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # 工具函式
-# ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def ensure_ohlcv(df):
     df = df.copy()
     if isinstance(df.columns, pd.MultiIndex):
@@ -61,7 +61,7 @@ def ensure_ohlcv(df):
 
 
 def garch_features(close_arr):
-    """回傳 GARCH 特徵，失敗時回傳 None dict。"""
+    """回傳 GARCH 特徵，失敗時回傳空 dict。"""
     try:
         from arch import arch_model
         rets = pd.Series(np.diff(np.log(close_arr)) * 100).dropna()
@@ -220,9 +220,9 @@ def run_sim_and_mae(
     return mae
 
 
-# ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Main
-# ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--symbol",    required=True)
@@ -264,7 +264,6 @@ def main():
     df = ensure_ohlcv(df_raw)
     print(f"Total bars: {len(df)}")
 
-    # 找 end_date 對應 idx
     if "Date" in df.columns:
         dates = pd.to_datetime(df["Date"])
     elif "Datetime" in df.columns:
@@ -277,18 +276,18 @@ def main():
         raise ValueError(f"{end_dt.date()} 之前找不到資料")
     max_end_idx = int(mask.values.nonzero()[0][-1]) + 1
 
-    # 所有可用起點（往前每 step 根取一個，留出 forecast 的驗證空間）
+    # 收集所有候選起點（不重複）
+    seen = set()
     candidates = []
     idx = max_end_idx
     while idx >= MIN_BEFORE:
-        # 確認往後有足夠 forecast bars
-        if idx + args.forecast <= len(df):
+        if idx + args.forecast <= len(df) and idx not in seen:
             candidates.append(idx)
+            seen.add(idx)
         idx -= args.step
     candidates = list(reversed(candidates))
     print(f"候選起點數: {len(candidates)}")
 
-    # grid 總數
     grid = list(product(DRIFT_SCALE_GRID, MOMENTUM_BOOST_GRID, DRIFT_DECAY_GRID))
     total_combos = len(grid)
     print(f"Grid 大小: {total_combos} 組  x  {len(candidates)} 起點 = {total_combos * len(candidates)} 次模擬")
@@ -311,7 +310,9 @@ def main():
             FEATURE_KEYS = list(feats.keys())
 
         # 2. auto-calibrate 的 vol_multiplier（固定用，不 grid search）
-        log_rets = np.diff(np.log(df.iloc[train_end_idx - args.calib_window: train_end_idx]["Close"].values.astype(float)))
+        log_rets = np.diff(np.log(
+            df.iloc[train_end_idx - args.calib_window: train_end_idx]["Close"].values.astype(float)
+        ))
         rv = float(np.std(log_rets))
         vol_multiplier = float(np.clip(rv / max(theta.vol, 1e-8), 0.5, 3.0))
 

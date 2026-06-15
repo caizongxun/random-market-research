@@ -8,10 +8,11 @@ v9 修正：
 
 v9.1 新增：
   4. --start-date / --end-date：指定任意歷史時段測試
-     例: --start-date 2024-01-03 --end-date 2025-01-01
-     系統會自動以 end-date 為預測起點，往前取 lookback 根做訓練，
-     往後取 forecast 根做驗證（需在 end-date 之後有資料）。
-     不指定時，沿用舊行為（--period 從今天往回）。
+
+v9.2 新增：
+  5. --param-model：載入 train_param_model.py 訓練的 joblib 模型，
+     自動預測 drift_scale / drift_decay，取代 auto-calibrate 的對應值。
+     momentum_boost 固定 0.8（grid search 結果全為 0.8）。
 """
 
 from __future__ import annotations
@@ -82,6 +83,141 @@ def garch_vol_forecast(
 
 
 # ───────────────────────────────────────────────────────────────
+# 模型預測參數（--param-model）
+# ───────────────────────────────────────────────────────────────
+
+def load_param_model(model_path: str):
+    """載入 train_param_model.py 產出的 joblib payload。"""
+    try:
+        import joblib
+    except ImportError:
+        raise ImportError("請先安裝 joblib: pip install joblib")
+    return joblib.load(model_path)
+
+
+def extract_features_for_inference(df_window, theta_vol: float) -> dict:
+    """從 OHLCV 視窗算出與 collect_training_data.py 相同的特徵。"""
+    c = df_window["Close"].values.astype(float)
+    o = df_window["Open"].values.astype(float)
+    h = df_window["High"].values.astype(float)
+    l = df_window["Low"].values.astype(float)
+    v = df_window["Volume"].values.astype(float)
+
+    log_rets = np.diff(np.log(c))
+
+    vol_20  = float(np.std(log_rets[-20:])) if len(log_rets) >= 20 else float(np.std(log_rets))
+    vol_60  = float(np.std(log_rets[-60:])) if len(log_rets) >= 60 else float(np.std(log_rets))
+    vol_all = float(np.std(log_rets))
+
+    drift_20  = float(np.mean(log_rets[-20:])) if len(log_rets) >= 20 else float(np.mean(log_rets))
+    drift_60  = float(np.mean(log_rets[-60:])) if len(log_rets) >= 60 else float(np.mean(log_rets))
+    drift_all = float(np.mean(log_rets))
+
+    s = pd.Series(log_rets)
+    ret_autocorr = float(s.autocorr(lag=1)) if len(s) > 10 else 0.0
+    ret_autocorr = 0.0 if np.isnan(ret_autocorr) else ret_autocorr
+
+    vret = pd.Series(v).pct_change().dropna()
+    vol_autocorr = float(vret.autocorr(lag=1)) if len(vret) > 10 else 0.0
+    vol_autocorr = max(0.0, 0.0 if np.isnan(vol_autocorr) else vol_autocorr)
+
+    body_pct  = np.abs(c - o) / (o + 1e-8)
+    avg_body  = float(np.mean(body_pct))
+    body_size = np.abs(c - o) + 1e-8
+    sr        = (h - l) / body_size
+    median_sr = float(np.median(sr))
+    p90_sr    = float(np.percentile(sr, 90))
+
+    try:
+        from backbone_fitter import BackboneFitter
+        fitter = BackboneFitter(n_seg=6, smooth_reg=0.5)
+        bb = fitter.fit(c[-120:] if len(c) >= 120 else c)
+        bb_last_drift = float(bb.segment_drifts[-1])
+        bb_last_vol   = float(bb.segment_vols[-1])
+        bb_drift_std  = float(np.std(bb.segment_drifts))
+        bb_vol_std    = float(np.std(bb.segment_vols))
+    except Exception:
+        bb_last_drift = drift_all
+        bb_last_vol   = vol_all
+        bb_drift_std  = 0.0
+        bb_vol_std    = 0.0
+
+    feat = {
+        "feat_vol_20":              round(vol_20 * 100, 4),
+        "feat_vol_60":              round(vol_60 * 100, 4),
+        "feat_vol_all":             round(vol_all * 100, 4),
+        "feat_vol_ratio_20_60":     round(vol_20 / (vol_60 + 1e-8), 4),
+        "feat_vol_ratio_rv_theta":  round(vol_20 / (theta_vol + 1e-8), 4),
+        "feat_drift_20":            round(drift_20 * 100, 4),
+        "feat_drift_60":            round(drift_60 * 100, 4),
+        "feat_drift_all":           round(drift_all * 100, 4),
+        "feat_drift_ratio_20_all":  round(drift_20 / (abs(drift_all) + 1e-8) * np.sign(drift_all + 1e-12), 4),
+        "feat_ret_autocorr":        round(ret_autocorr, 4),
+        "feat_vol_autocorr":        round(vol_autocorr, 4),
+        "feat_avg_body_pct":        round(avg_body * 100, 4),
+        "feat_median_sr":           round(median_sr, 4),
+        "feat_p90_sr":              round(p90_sr, 4),
+        "feat_bb_last_drift":       round(bb_last_drift * 100, 4),
+        "feat_bb_last_vol":         round(bb_last_vol * 100, 4),
+        "feat_bb_drift_std":        round(bb_drift_std * 100, 4),
+        "feat_bb_vol_std":          round(bb_vol_std * 100, 4),
+    }
+
+    # GARCH 特徵（失敗時補 0）
+    try:
+        from arch import arch_model
+        rets = pd.Series(np.diff(np.log(c)) * 100).dropna()
+        if len(rets) >= 60:
+            am  = arch_model(rets, vol="Garch", p=1, o=1, q=1, dist="t")
+            res = am.fit(disp="off", show_warning=False)
+            p   = res.params
+            alpha = float(p.get("alpha[1]", 0))
+            gamma = float(p.get("gamma[1]", 0))
+            beta  = float(p.get("beta[1]",  0))
+            fc    = res.forecast(horizon=1, reindex=False)
+            fvol  = float(np.sqrt(fc.variance.values[-1, 0])) / 100
+            feat["feat_garch_alpha"]       = round(alpha, 4)
+            feat["feat_garch_gamma"]       = round(gamma, 4)
+            feat["feat_garch_beta"]        = round(beta,  4)
+            feat["feat_garch_persistence"] = round(alpha + beta + 0.5 * gamma, 4)
+            feat["feat_garch_forecast_vol"] = round(fvol * 100, 4)
+        else:
+            raise ValueError("too few")
+    except Exception:
+        feat["feat_garch_alpha"]       = 0.0
+        feat["feat_garch_gamma"]       = 0.0
+        feat["feat_garch_beta"]        = 0.0
+        feat["feat_garch_persistence"] = 0.0
+        feat["feat_garch_forecast_vol"] = 0.0
+
+    return feat
+
+
+def predict_params_from_model(payload: dict, feat_dict: dict) -> dict:
+    """
+    用 joblib payload 預測 drift_scale / drift_decay。
+    momentum_boost 固定 0.8（訓練資料顯示 grid search 全選 0.8）。
+    """
+    import numpy as np
+    feature_cols = payload["feature_cols"]
+    models       = payload["models"]
+
+    X = np.array([[feat_dict.get(k, 0.0) for k in feature_cols]])
+
+    result = {"momentum_boost": 0.8}  # 固定
+
+    if "target_drift_scale" in models:
+        ds = float(models["target_drift_scale"].predict(X)[0])
+        result["drift_scale"] = round(float(np.clip(ds, 0.3, 3.2)), 3)
+
+    if "target_drift_decay" in models:
+        dd = float(models["target_drift_decay"].predict(X)[0])
+        result["drift_decay"] = round(float(np.clip(dd, 0.03, 0.13)), 4)
+
+    return result
+
+
+# ───────────────────────────────────────────────────────────────
 # 公用工具
 # ───────────────────────────────────────────────────────────────
 
@@ -121,11 +257,14 @@ def parse_args():
                    help="實體大小上限 (%%/day)，超過時自動縮放 vol （預設 1.5%%）")
     # ── v9.1 新增：任意歷史時段 ──────────────────────────────────
     p.add_argument("--start-date", default=None,
-                   help="資料下載起始日 (YYYY-MM-DD)。與 --end-date 搭配使用，"
-                        "取代 --period。建議比預測起點早至少 600 個交易日。")
+                   help="資料下載起始日 (YYYY-MM-DD)")
     p.add_argument("--end-date", default=None,
-                   help="預測起點日 (YYYY-MM-DD)。程式以此日最後收盤為 start_price，"
-                        "往前取 lookback 根訓練，往後取 forecast 根驗證。")
+                   help="預測起點日 (YYYY-MM-DD)")
+    # ── v9.2 新增：模型預測參數 ──────────────────────────────────
+    p.add_argument("--param-model", default=None,
+                   help="train_param_model.py 產出的 .joblib 路徑。"
+                        "載入後自動預測 drift_scale / drift_decay，"
+                        "覆蓋 auto-calibrate 的對應值。")
     return p.parse_args()
 
 
@@ -242,11 +381,6 @@ def scale_candle_bodies(
     ohlcv_open, ohlcv_close, ohlcv_high, ohlcv_low,
     start_price: float, target_body_pct: float = 1.0,
 ):
-    """
-    當預測 K 棒實體平均超過 target_body_pct 時，
-    按比例縮小每根 K 棒的開收距離（中心點不動）。
-    高低影線同比例縮小。
-    """
     body_sizes = np.abs(ohlcv_close - ohlcv_open)
     avg_body_pct = float(np.mean(body_sizes / start_price * 100))
     if avg_body_pct <= target_body_pct:
@@ -295,6 +429,7 @@ def print_diagnostics(
     rv, vol_scale, last_drift, last_vol, bb_result,
     result, clamped_high, clamped_low, start_price, metrics,
     calib_info=None, body_scale_applied=False,
+    model_predicted_params=None,
 ):
     T = args.forecast
     actual_end   = float(actual_close[-1]) if len(actual_close) else None
@@ -336,7 +471,7 @@ def print_diagnostics(
 
     print()
     print("=" * 60)
-    print("  VERBOSE DIAGNOSTICS (v9 GJR-GARCH + auto-calibrate)")
+    print("  VERBOSE DIAGNOSTICS (v9.2 GJR-GARCH + auto-calibrate + param-model)")
     print("=" * 60)
 
     if calib_info is not None:
@@ -348,7 +483,7 @@ def print_diagnostics(
         print(f"  median_shadow_ratio  : {calib_info['_median_sr']:.3f}  → shadow_noise={args.shadow_noise}")
         print(f"  p90_shadow_ratio     : {calib_info['_p90_sr']:.3f}  → shadow_clamp={args.shadow_clamp}")
         print(f"  vol_autocorr         : {calib_info['_vol_autocorr']:+.4f}  → momentum_boost={args.momentum_boost}")
-        print(f"  ret_autocorr         : {calib_info['_ret_autocorr']:+.4f}  → drift_decay={args.drift_decay}")
+        print(f"  ret_autocorr         : {calib_info['_ret_autocorr']:+.4f}  → drift_decay(base)={calib_info['drift_decay']}")
         if vs == "garch" and gi and "error" not in gi:
             print(f"  [v9 GJR-GARCH-t 波動率預測]")
             print(f"    model          : {gi.get('model','?')}")
@@ -362,9 +497,17 @@ def print_diagnostics(
             err = gi.get("error", "unknown") if gi else "disabled"
             print(f"  realized_vol/theta   : {calib_info['_rv_pct']:.4f}%/{theta.vol*100:.4f}%  → vol_multiplier={args.vol_multiplier}")
             print(f"  vol_source           : rv_fallback  (garch 失敗: {err})")
-        print(f"  last_seg / hist_all  : {calib_info['_last_seg_drift']:+.4f}% / {calib_info['_hist_drift_all']:+.4f}%  → drift_scale={args.drift_scale}")
+        print(f"  last_seg / hist_all  : {calib_info['_last_seg_drift']:+.4f}% / {calib_info['_hist_drift_all']:+.4f}%")
         if body_scale_applied:
-            print(f"  body_scale           : applied \u2705 (實體縮至 ~{args.body_scale_max:.1f}%)")
+            print(f"  body_scale           : applied ✅ (實體縮至 ~{args.body_scale_max:.1f}%)")
+
+    # ── 模型預測參數顯示 ─────────────────────────────────────────
+    if model_predicted_params is not None:
+        print(f"\n[ML 模型預測參數 (--param-model)]")
+        print(f"  drift_scale   : {model_predicted_params.get('drift_scale', 'N/A')}  ← 模型預測（已覆蓋 auto-calibrate）")
+        print(f"  drift_decay   : {model_predicted_params.get('drift_decay', 'N/A')}  ← 模型預測（已覆蓋 auto-calibrate）")
+        print(f"  momentum_boost: {model_predicted_params.get('momentum_boost', 0.8)}  ← 固定值（grid search 結果）")
+        print(f"  ➜ 最終使用: drift_scale={args.drift_scale}  drift_decay={args.drift_decay}  momentum_boost={args.momentum_boost}")
 
     print(f"\n[資料概況]")
     print(f"  symbol        : {args.symbol}")
@@ -380,16 +523,16 @@ def print_diagnostics(
     print(f"\n[帶子中心偏移分析]")
     if center_bias is not None:
         direction = (
-            "\u2191 median 高估 \u2192 降低 drift_scale" if center_bias > 0
-            else "\u2193 median 低估 \u2192 提高 drift_scale"
+            "↑ median 高估 → 降低 drift_scale" if center_bias > 0
+            else "↓ median 低估 → 提高 drift_scale"
         )
-        flag = " \u2705" if abs(center_bias) <= 3 else " \u274c"
+        flag = " ✅" if abs(center_bias) <= 3 else " ❌"
         print(f"  center_bias        : {center_bias:+.2f}%  {direction}{flag}")
     print(f"  band_width_p10_90  : {band_width:.2f}%  (判斷: >{T*0.5:.0f}%=寬, <{T*0.2:.0f}%=窄)")
 
     print(f"\n[K 棒形態診斷]")
-    status_body = " \u2705" if 0.3 <= avg_body_pct <= 1.5 else (" \u26a0 太大" if avg_body_pct > 1.5 else " \u274c 太小")
-    status_shad = " \u2705" if avg_shadow_ratio <= 2.0 else f" \u274c 過大"
+    status_body = " ✅" if 0.3 <= avg_body_pct <= 1.5 else (" ⚠ 太大" if avg_body_pct > 1.5 else " ❌ 太小")
+    status_shad = " ✅" if avg_shadow_ratio <= 2.0 else f" ❌ 過大"
     print(f"  avg_body_pct       : {avg_body_pct:.3f}%  (目標: 0.3~1.5%){status_body}")
     print(f"  avg_shadow_ratio   : {avg_shadow_ratio:.2f}   (目標: 0.5~2.0){status_shad}")
     print(f"  p50_shadow_ratio   : {p50_shadow_ratio:.2f}")
@@ -442,40 +585,40 @@ def print_diagnostics(
     for k, v in metrics.items():
         flag = ""
         if k == "hit_rate_10_90":
-            flag = " \u2705 好" if v >= 0.7 else (" \u26a0 可接受" if v >= 0.5 else " \u274c 帶子太窄")
+            flag = " ✅ 好" if v >= 0.7 else (" ⚠ 可接受" if v >= 0.5 else " ❌ 帶子太窄")
         if k == "hit_rate_25_75":
-            flag = " \u2705 好" if v >= 0.4 else (" \u26a0 可接受" if v >= 0.25 else " \u274c 帶子心線偏差")
+            flag = " ✅ 好" if v >= 0.4 else (" ⚠ 可接受" if v >= 0.25 else " ❌ 帶子心線偏差")
         if k == "direction_acc":
-            flag = " \u2705 好" if v >= 0.6 else (" \u26a0 遠於隨機" if v >= 0.5 else " \u274c 差於擲母")
+            flag = " ✅ 好" if v >= 0.6 else (" ⚠ 遠於隨機" if v >= 0.5 else " ❌ 差於擲母")
         if k == "bars_above_p90" and isinstance(v, int):
             pct = v / max(metrics.get("n_compared", 30), 1)
-            if pct > 0.3: flag = f" \u274c 帶子偶爾偏低({pct:.0%})"
+            if pct > 0.3: flag = f" ❌ 帶子偶爾偏低({pct:.0%})"
         if k == "bars_below_p10" and isinstance(v, int):
             pct = v / max(metrics.get("n_compared", 30), 1)
-            if pct > 0.3: flag = f" \u274c 帶子偶爾偏高({pct:.0%})"
+            if pct > 0.3: flag = f" ❌ 帶子偶爾偏高({pct:.0%})"
         print(f"  {k:25s}: {v}{flag}")
 
     print(f"\n[自動建議]")
     suggestions = []
     if metrics.get("hit_rate_10_90", 0) < 0.5:
-        suggestions.append("  \u2022 帶子太窄: --vol-multiplier +0.3")
+        suggestions.append("  • 帶子太窄: --vol-multiplier +0.3")
     if metrics.get("hit_rate_10_90", 0) > 0.95 and metrics.get("hit_rate_25_75", 0) < 0.25:
-        suggestions.append("  \u2022 帶子寬但中心線偏: 調整 drift_scale")
+        suggestions.append("  • 帶子寬但中心線偏: 調整 drift_scale")
     if center_bias is not None:
         if center_bias > 3.0:
             new_ds = round(args.drift_scale * 0.7, 2)
-            suggestions.append(f"  \u2022 median 明顯偏高 {center_bias:+.1f}%: --drift-scale {new_ds}")
+            suggestions.append(f"  • median 明顯偏高 {center_bias:+.1f}%: --drift-scale {new_ds}")
         elif center_bias < -3.0:
             new_ds = round(min(args.drift_scale * 1.35, 2.0), 2)
-            suggestions.append(f"  \u2022 median 明顯偏低 {center_bias:+.1f}%: --drift-scale {new_ds}")
+            suggestions.append(f"  • median 明顯偏低 {center_bias:+.1f}%: --drift-scale {new_ds}")
         else:
-            suggestions.append(f"  \u2022 帶子中心線偏移 {center_bias:+.1f}% \u2705 可接受")
+            suggestions.append(f"  • 帶子中心線偏移 {center_bias:+.1f}% ✅ 可接受")
     if metrics.get("direction_acc", 1) < 0.5:
         suggestions.append(
-            f"  \u2022 方向準確度差: --momentum-boost {round(min(args.momentum_boost + 0.3, 2.5), 1)}"
+            f"  • 方向準確度差: --momentum-boost {round(min(args.momentum_boost + 0.3, 2.5), 1)}"
         )
     if not suggestions:
-        suggestions.append("  \u2022 目前參數已處於較好狀態 \u2705")
+        suggestions.append("  • 目前參數已處於較好狀態 ✅")
     for s in suggestions:
         print(s)
     print("=" * 60)
@@ -487,20 +630,27 @@ def main():
     with open(args.theta) as f:
         theta = CalibratedTheta.from_dict(json.load(f))
 
+    # 載入 param-model（若有指定）
+    param_model_payload = None
+    if args.param_model:
+        print(f"[param-model] 載入 {args.param_model}")
+        param_model_payload = load_param_model(args.param_model)
+        print(f"  model_name   : {param_model_payload.get('model_name', '?')}")
+        print(f"  n_features   : {len(param_model_payload.get('feature_cols', []))}")
+        cv = param_model_payload.get('cv_results', {})
+        for t, r in cv.items():
+            print(f"  {t}: CV_MAE={r['cv_mae']:.4f}")
+
     print(f"Downloading {args.symbol}...")
 
     # ── v9.1：支援指定歷史時段 ────────────────────────────────────
     if args.start_date or args.end_date:
-        # 以 end_date 為預測起點，start_date 為資料起始
-        # 若只給 end_date，自動往前推 4 年當 start_date
         end_dt   = pd.Timestamp(args.end_date) if args.end_date else pd.Timestamp.today()
         if args.start_date:
             start_dt = pd.Timestamp(args.start_date)
         else:
             start_dt = end_dt - pd.DateOffset(years=4)
 
-        # yfinance end 是 exclusive，加一天確保 end_date 當天資料包含進來
-        # 同時額外多抓 forecast 根的驗證資料
         dl_end = end_dt + pd.DateOffset(days=args.forecast * 2 + 10)
         df_raw = yf.download(
             args.symbol,
@@ -511,7 +661,6 @@ def main():
         )
         df = ensure_ohlcv(df_raw)
 
-        # 找到 end_date 對應的 bar index（取最接近且 <= end_date 的交易日）
         if "Date" in df.columns:
             dates = pd.to_datetime(df["Date"])
         elif "Datetime" in df.columns:
@@ -522,12 +671,11 @@ def main():
         mask = dates <= end_dt
         if not mask.any():
             raise ValueError(f"在 {end_dt.date()} 之前找不到資料，請確認 --start-date 夠早")
-        train_end_idx = int(mask.values.nonzero()[0][-1]) + 1  # inclusive end
+        train_end_idx = int(mask.values.nonzero()[0][-1]) + 1
         print(f"Total bars (downloaded): {len(df)}")
         print(f"Pinned train_end_idx={train_end_idx}  "
               f"({dates.iloc[train_end_idx-1].date()} 為預測起點)")
     else:
-        # 舊行為：從今天往回抓 period
         df_raw = yf.download(args.symbol, period=args.period, interval=args.interval,
                              auto_adjust=False, progress=False)
         df = ensure_ohlcv(df_raw)
@@ -605,8 +753,8 @@ def main():
         print(f"  intra_bar={args.intra_bar}  shadow_noise={args.shadow_noise}  shadow_clamp={args.shadow_clamp}")
         print(f"  momentum_boost={args.momentum_boost}  drift_decay={args.drift_decay}")
         if vs == "garch" and gi and "error" not in gi:
-            print(f"  vol_multiplier={args.vol_multiplier}  [GJR-GARCH \u03c3={gi.get('forecast_vol_pct','?')}%/day  "
-                  f"\u03b3={gi.get('gamma','?')} \u03b2={gi.get('beta','?')} persistence={gi.get('persistence','?')}]")
+            print(f"  vol_multiplier={args.vol_multiplier}  [GJR-GARCH σ={gi.get('forecast_vol_pct','?')}%/day  "
+                  f"γ={gi.get('gamma','?')} β={gi.get('beta','?')} persistence={gi.get('persistence','?')}]")
         else:
             print(f"  vol_multiplier={args.vol_multiplier}  [rv/theta fallback]  drift_scale={args.drift_scale}")
     else:
@@ -617,6 +765,21 @@ def main():
         if args.drift_decay    is None: args.drift_decay    = 0.04
         if args.vol_multiplier is None: args.vol_multiplier = 1.2
         if args.drift_scale    is None: args.drift_scale    = 1.18
+
+    # ── v9.2：用 ML 模型覆蓋 drift_scale / drift_decay ─────────
+    model_predicted_params = None
+    if param_model_payload is not None:
+        print(f"\n[param-model] 計算特徵並預測參數...")
+        feat_dict = extract_features_for_inference(calib_df, theta.vol)
+        model_predicted_params = predict_params_from_model(param_model_payload, feat_dict)
+        # 只覆蓋沒有被命令列明確指定的參數（尊重手動 override）
+        if args.drift_scale is None or args.auto_calibrate:
+            args.drift_scale    = model_predicted_params.get("drift_scale",    args.drift_scale)
+        if args.drift_decay is None or args.auto_calibrate:
+            args.drift_decay    = model_predicted_params.get("drift_decay",    args.drift_decay)
+        # momentum_boost 固定 0.8
+        args.momentum_boost = model_predicted_params.get("momentum_boost", 0.8)
+        print(f"  → drift_scale={args.drift_scale}  drift_decay={args.drift_decay}  momentum_boost={args.momentum_boost}")
 
     vol_fwd_scaled = vol_fwd * args.vol_multiplier
 
@@ -657,7 +820,6 @@ def main():
         args.shadow_clamp
     )
 
-    # ── body_scale ：縮小過大實體（解決大紅K問題） ──
     body_scale_applied = False
     body_sizes_raw = np.abs(result.ohlcv_close - result.ohlcv_open)
     avg_body_raw   = float(np.mean(body_sizes_raw / start_price * 100))
@@ -693,6 +855,7 @@ def main():
         start_price=start_price, metrics=metrics,
         calib_info=calib_info,
         body_scale_applied=body_scale_applied,
+        model_predicted_params=model_predicted_params,
     )
 
     out_prefix   = Path(args.output)
@@ -718,6 +881,8 @@ def main():
             "vol_model":        args.garch_model if not args.no_garch else "rv_static",
             "garch_info":       calib_info.get("_garch_info", {}) if calib_info else {},
             "pinned_end_date":  args.end_date,
+            "param_model_used": args.param_model is not None,
+            "ml_predicted":     model_predicted_params,
         }, f, indent=2)
 
     actual_deviation = None
@@ -725,7 +890,8 @@ def main():
         m = min(len(actual_close), len(result.median_path))
         actual_deviation = (actual_close[:m] - result.median_path[:m]) / start_price * 100
 
-    mode_tag = f"v9-{args.garch_model}(w={args.calib_window})" if args.auto_calibrate else "manual"
+    model_tag = "+ML" if param_model_payload else ""
+    mode_tag = f"v9.2-{args.garch_model}(w={args.calib_window}){model_tag}" if args.auto_calibrate else "manual"
     hit_str = ""
     if metrics:
         hit_str = (
@@ -769,7 +935,7 @@ def main():
     )
     plt.close(fig)
 
-    print(f"\n\u2714 Forward study v9 完成")
+    print(f"\n✔ Forward study v9.2 完成")
     print(f"  K 棒圖 : {chart_path}")
     print(f"  指標   : {metrics_path}")
 
