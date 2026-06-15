@@ -8,6 +8,12 @@ collect_training_data.py
   - 同時記錄前500根的特徵向量
   - 把 (特徵, 最佳參數) 寫進 CSV
 
+特徵版本 v2（30 個 + GARCH 5 個 optional）
+新增特徵：
+  Group A（趨勢強度）: trend_strength_adx, rsi_14, price_pos_52w, obv_slope
+  Group B（開盤/流動性）: open_gap_mean, open_gap_vol, open_range_ratio, amihud_illiq
+  Group C（市場狀態）: hurst_exp, trend_consistency_20, vol_of_vol, skew_20
+
 用法：
   python scripts/collect_training_data.py \\
     --symbol AAPL \\
@@ -87,8 +93,192 @@ def garch_features(close_arr):
         return {}
 
 
+# ─────────────────────────────────────────────────────────────
+# Group A：趨勢強度特徵
+# ─────────────────────────────────────────────────────────────
+def _adx(h, l, c, period=14):
+    """計算 ADX(period)，回傳最後一個值。資料不足時回傳 20.0（中性）。"""
+    n = len(c)
+    if n < period + 2:
+        return 20.0
+    tr  = np.maximum(h[1:] - l[1:],
+          np.maximum(np.abs(h[1:] - c[:-1]),
+                     np.abs(l[1:] - c[:-1])))
+    dmp = np.where((h[1:] - h[:-1]) > (l[:-1] - l[1:]),
+                   np.maximum(h[1:] - h[:-1], 0.0), 0.0)
+    dmm = np.where((l[:-1] - l[1:]) > (h[1:] - h[:-1]),
+                   np.maximum(l[:-1] - l[1:], 0.0), 0.0)
+
+    def _ema_wilder(arr, p):
+        out = np.empty(len(arr))
+        out[0] = arr[0]
+        k = 1.0 / p
+        for i in range(1, len(arr)):
+            out[i] = out[i-1] * (1 - k) + arr[i] * k
+        return out
+
+    atr   = _ema_wilder(tr,  period)
+    dipos = _ema_wilder(dmp, period) / (atr + 1e-8) * 100
+    dinos = _ema_wilder(dmm, period) / (atr + 1e-8) * 100
+    dx    = np.abs(dipos - dinos) / (dipos + dinos + 1e-8) * 100
+    adx   = _ema_wilder(dx, period)
+    return float(adx[-1])
+
+
+def _rsi(close_arr, period=14):
+    """標準 RSI(period)，值域 0~100。資料不足回傳 50.0（中性）。"""
+    if len(close_arr) < period + 1:
+        return 50.0
+    delta = np.diff(close_arr.astype(float))
+    gain  = np.where(delta > 0, delta, 0.0)
+    loss  = np.where(delta < 0, -delta, 0.0)
+    avg_g = float(np.mean(gain[-period:]))
+    avg_l = float(np.mean(loss[-period:]))
+    if avg_l < 1e-10:
+        return 100.0
+    rs = avg_g / avg_l
+    return round(100.0 - 100.0 / (1.0 + rs), 4)
+
+
+def _obv_slope(close_arr, volume_arr, window=20):
+    """OBV 最近 window 日線性回歸斜率（正規化到均值）。"""
+    if len(close_arr) < window + 1:
+        return 0.0
+    c = close_arr[-window-1:]
+    v = volume_arr[-window-1:]
+    direction = np.sign(np.diff(c))
+    obv = np.cumsum(direction * v[1:])
+    if len(obv) < 2:
+        return 0.0
+    x = np.arange(len(obv), dtype=float)
+    slope = float(np.polyfit(x, obv, 1)[0])
+    mean_vol = float(np.mean(v) + 1e-8)
+    return round(slope / mean_vol, 6)
+
+
+# ─────────────────────────────────────────────────────────────
+# Group B：開盤 / 流動性特徵
+# ─────────────────────────────────────────────────────────────
+def _open_gap_stats(open_arr, close_arr, window=20):
+    """
+    計算開盤跳空統計。
+    open_gap = open_t / close_{t-1} - 1
+    回傳 (mean, std) 最近 window 根。
+    """
+    if len(open_arr) < window + 1:
+        window = len(open_arr) - 1
+    if window < 2:
+        return 0.0, 0.0
+    gaps = open_arr[1:] / (close_arr[:-1] + 1e-8) - 1.0
+    gaps = gaps[-window:]
+    return float(np.mean(gaps)), float(np.std(gaps))
+
+
+def _open_range_ratio(open_arr, high_arr, low_arr, close_arr, window=20):
+    """
+    開盤到首次高/低的 range 佔全日 range 的比例代理（日線）。
+    用 |open - (high 或 low 較近者)| / (high - low) 估計。
+    """
+    if len(open_arr) < window:
+        window = len(open_arr)
+    o = open_arr[-window:]
+    h = high_arr[-window:]
+    l = low_arr[-window:]
+    c = close_arr[-window:]
+    full_range = h - l + 1e-8
+    open_to_extreme = np.minimum(np.abs(o - h), np.abs(o - l))
+    ratio = open_to_extreme / full_range
+    return round(float(np.mean(ratio)), 4)
+
+
+def _amihud_illiq(close_arr, volume_arr, window=20):
+    """
+    Amihud 非流動性：mean(|ret| / dollar_volume) * 1e6。
+    值越大代表流動性越差（每單位成交量衝擊越大）。
+    """
+    if len(close_arr) < window + 1:
+        window = len(close_arr) - 1
+    if window < 2:
+        return 0.0
+    c = close_arr[-window-1:]
+    v = volume_arr[-window-1:]
+    rets   = np.abs(np.diff(np.log(c + 1e-8)))
+    dollar = (c[1:] * v[1:] + 1e-8)
+    illiq  = rets / dollar * 1e6
+    return round(float(np.mean(illiq)), 6)
+
+
+# ─────────────────────────────────────────────────────────────
+# Group C：市場狀態分類特徵
+# ─────────────────────────────────────────────────────────────
+def _hurst_rs(close_arr, window=100):
+    """
+    R/S 分析估計 Hurst exponent。
+    < 0.5 → 均值回歸，> 0.5 → 趨勢，≈ 0.5 → 隨機遊走。
+    使用多個 lag 做 OLS 估計，資料不足時回傳 0.5（中性）。
+    """
+    c = close_arr[-window:] if len(close_arr) >= window else close_arr
+    n = len(c)
+    if n < 20:
+        return 0.5
+    log_rets = np.diff(np.log(c + 1e-8))
+    lags = [max(2, n // 8), max(4, n // 4), max(8, n // 2), n - 1]
+    lags = sorted(set([l for l in lags if 2 <= l < len(log_rets)]))
+    if len(lags) < 2:
+        return 0.5
+    rs_vals = []
+    for lag in lags:
+        sub = log_rets[:lag]
+        mean_sub = np.mean(sub)
+        dev = np.cumsum(sub - mean_sub)
+        r = float(np.max(dev) - np.min(dev))
+        s = float(np.std(sub, ddof=1) + 1e-10)
+        rs_vals.append(r / s)
+    log_lags = np.log(lags)
+    log_rs   = np.log(np.array(rs_vals) + 1e-10)
+    if np.ptp(log_lags) < 1e-8:
+        return 0.5
+    h = float(np.polyfit(log_lags, log_rs, 1)[0])
+    return round(float(np.clip(h, 0.1, 0.9)), 4)
+
+
+def _trend_consistency(log_rets, window=20):
+    """
+    最近 window 日中方向一致的比例：0.5 = 隨機，1.0 = 全部同方向。
+    定義為 max(漲日比例, 跌日比例)。
+    """
+    if len(log_rets) < window:
+        window = len(log_rets)
+    if window < 2:
+        return 0.5
+    r = log_rets[-window:]
+    up_ratio = float(np.sum(r > 0)) / window
+    return round(max(up_ratio, 1.0 - up_ratio), 4)
+
+
+def _vol_of_vol(log_rets, outer_window=60, inner_window=5):
+    """
+    二階波動率：計算 rolling(inner_window) std，再取其在 outer_window 內的 std。
+    """
+    if len(log_rets) < outer_window:
+        outer_window = len(log_rets)
+    if outer_window < inner_window + 2:
+        return 0.0
+    rets = log_rets[-outer_window:]
+    roll_vols = [
+        float(np.std(rets[max(0, i-inner_window):i]))
+        for i in range(inner_window, len(rets) + 1)
+    ]
+    if len(roll_vols) < 2:
+        return 0.0
+    return round(float(np.std(roll_vols)) * 100, 4)
+
+
+# ─────────────────────────────────────────────────────────────
+# 主特徵提取函式（v2）
+# ─────────────────────────────────────────────────────────────
 def extract_features(df_window, theta_vol):
-    """從一段 OHLCV 視窗計算特徵向量。"""
+    """從一段 OHLCV 視窗計算特徵向量（v2，30個 + GARCH 5個 optional）。"""
     c = df_window["Close"].values.astype(float)
     o = df_window["Open"].values.astype(float)
     h = df_window["High"].values.astype(float)
@@ -97,6 +287,7 @@ def extract_features(df_window, theta_vol):
 
     log_rets = np.diff(np.log(c))
 
+    # ── 原有特徵（v1） ──────────────────────────────────────
     vol_20  = float(np.std(log_rets[-20:])) if len(log_rets) >= 20 else float(np.std(log_rets))
     vol_60  = float(np.std(log_rets[-60:])) if len(log_rets) >= 60 else float(np.std(log_rets))
     vol_all = float(np.std(log_rets))
@@ -134,25 +325,62 @@ def extract_features(df_window, theta_vol):
         bb_drift_std  = 0.0
         bb_vol_std    = 0.0
 
+    # ── Group A：趨勢強度 ───────────────────────────────────
+    adx_val      = _adx(h, l, c, period=14)
+    rsi_val      = _rsi(c, period=14)
+    # 52 週（252 日）相對位置，不足 252 日用全部
+    c_52w = c[-252:] if len(c) >= 252 else c
+    c_min, c_max = float(np.min(c_52w)), float(np.max(c_52w))
+    price_pos_52w = round((c[-1] - c_min) / (c_max - c_min + 1e-8), 4)
+    obv_slope_val = _obv_slope(c, v, window=20)
+
+    # ── Group B：開盤 / 流動性 ──────────────────────────────
+    gap_mean, gap_vol   = _open_gap_stats(o, c, window=20)
+    open_rng_ratio      = _open_range_ratio(o, h, l, c, window=20)
+    amihud_val          = _amihud_illiq(c, v, window=20)
+
+    # ── Group C：市場狀態 ───────────────────────────────────
+    hurst_val           = _hurst_rs(c, window=100)
+    trend_cons_val      = _trend_consistency(log_rets, window=20)
+    vov_val             = _vol_of_vol(log_rets, outer_window=60, inner_window=5)
+    skew_20_val         = float(pd.Series(log_rets[-20:]).skew()) if len(log_rets) >= 20 else 0.0
+    skew_20_val         = 0.0 if np.isnan(skew_20_val) else round(skew_20_val, 4)
+
     feat = {
-        "vol_20":          round(vol_20 * 100, 4),
-        "vol_60":          round(vol_60 * 100, 4),
-        "vol_all":         round(vol_all * 100, 4),
-        "vol_ratio_20_60": round(vol_20 / (vol_60 + 1e-8), 4),
-        "vol_ratio_rv_theta": round(vol_20 / (theta_vol + 1e-8), 4),
-        "drift_20":        round(drift_20 * 100, 4),
-        "drift_60":        round(drift_60 * 100, 4),
-        "drift_all":       round(drift_all * 100, 4),
-        "drift_ratio_20_all": round(drift_20 / (abs(drift_all) + 1e-8) * np.sign(drift_all + 1e-12), 4),
-        "ret_autocorr":    round(ret_autocorr, 4),
-        "vol_autocorr":    round(vol_autocorr, 4),
-        "avg_body_pct":    round(avg_body * 100, 4),
-        "median_sr":       round(median_sr, 4),
-        "p90_sr":          round(p90_sr, 4),
-        "bb_last_drift":   round(bb_last_drift * 100, 4),
-        "bb_last_vol":     round(bb_last_vol * 100, 4),
-        "bb_drift_std":    round(bb_drift_std * 100, 4),
-        "bb_vol_std":      round(bb_vol_std * 100, 4),
+        # v1 原有
+        "vol_20":               round(vol_20 * 100, 4),
+        "vol_60":               round(vol_60 * 100, 4),
+        "vol_all":              round(vol_all * 100, 4),
+        "vol_ratio_20_60":      round(vol_20 / (vol_60 + 1e-8), 4),
+        "vol_ratio_rv_theta":   round(vol_20 / (theta_vol + 1e-8), 4),
+        "drift_20":             round(drift_20 * 100, 4),
+        "drift_60":             round(drift_60 * 100, 4),
+        "drift_all":            round(drift_all * 100, 4),
+        "drift_ratio_20_all":   round(drift_20 / (abs(drift_all) + 1e-8) * np.sign(drift_all + 1e-12), 4),
+        "ret_autocorr":         round(ret_autocorr, 4),
+        "vol_autocorr":         round(vol_autocorr, 4),
+        "avg_body_pct":         round(avg_body * 100, 4),
+        "median_sr":            round(median_sr, 4),
+        "p90_sr":               round(p90_sr, 4),
+        "bb_last_drift":        round(bb_last_drift * 100, 4),
+        "bb_last_vol":          round(bb_last_vol * 100, 4),
+        "bb_drift_std":         round(bb_drift_std * 100, 4),
+        "bb_vol_std":           round(bb_vol_std * 100, 4),
+        # Group A
+        "trend_strength_adx":   round(adx_val, 4),
+        "rsi_14":               round(rsi_val, 4),
+        "price_pos_52w":        price_pos_52w,
+        "obv_slope":            obv_slope_val,
+        # Group B
+        "open_gap_mean":        round(gap_mean * 100, 4),
+        "open_gap_vol":         round(gap_vol * 100, 4),
+        "open_range_ratio":     open_rng_ratio,
+        "amihud_illiq":         amihud_val,
+        # Group C
+        "hurst_exp":            hurst_val,
+        "trend_consistency_20": trend_cons_val,
+        "vol_of_vol":           vov_val,
+        "skew_20":              skew_20_val,
     }
     feat.update(garch_features(c))
     return feat
@@ -354,6 +582,7 @@ def main():
             writer.writeheader()
             writer.writerows(rows)
         print(f"\n✔ 已儲存 {len(rows)} 筆訓練資料 → {out_path}")
+        print(f"  特徵數: {len(FEATURE_KEYS)} 個（不含 GARCH optional）")
     else:
         print("\n⚠ 沒有產生任何資料，請確認時間範圍與資料筆數")
 
