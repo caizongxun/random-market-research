@@ -1,7 +1,7 @@
 """
 rolling_forward.py
 
-核心邏輯
+核心邏輪
 --------
 每「輪」只預測 N 根（預設 5），然後把「真實」的 N 根 K 棒
 接在歷史尾端，再重新校準 + 預測下一輪。
@@ -15,11 +15,13 @@ rolling_forward.py
   2     t=10                 t=11~15
   ...
 
-特點
-----
-- 每輪都重新呼叫 auto_calibrate + GJR-GARCH + backbone → drift 永遠基於最新資料
-- 預測窗口短 (5根) → 命中率高
-- 結果彙整成一張完整圖 + CSV + JSON
+方向命中定義（v2 修後）
+------------------
+「預測收盤相對前一根」 vs 「實際收盤相對前一根」
+  - P-Ret: (pred_t - actual_{t-1}) / actual_{t-1}
+  - A-Ret: (actual_t - actual_{t-1}) / actual_{t-1}
+  - Dir 命中: sign(P-Ret) == sign(A-Ret)
+兩者基準一致，即可相互比較。
 
 用法
 ----
@@ -31,12 +33,6 @@ rolling_forward.py
     --step 5 \\
     --auto-calibrate \\
     --verbose
-
-  # 只預測未來（沒有實際收盤可對照）
-  python scripts/rolling_forward.py \\
-    --symbol AAPL \\
-    --theta results/theta_aapl.json \\
-    --auto-calibrate
 """
 
 from __future__ import annotations
@@ -64,7 +60,6 @@ from backbone_fitter        import BackboneFitter
 from calibrated_simulator   import CalibratedTheta, build_params_from_theta
 from us_equity_simulator    import USStockFutureSimulator
 
-# ── forward_study の共用函式を inline import ──────────────────────────────────
 from forward_study import (
     garch_vol_forecast,
     compute_sr_drift_adjustment,
@@ -83,7 +78,7 @@ except ImportError:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 單輪預測（predict step=N bars from close_hist）
+# 單輪預測
 # ──────────────────────────────────────────────────────────────────────────────
 def _run_one_step(
     close_hist: np.ndarray,
@@ -91,13 +86,8 @@ def _run_one_step(
     args,
     full_df_up_to_now: pd.DataFrame,
 ) -> tuple[np.ndarray, dict | None]:
-    """
-    用 close_hist（最近 lookback 根）做一輪 step 根預測。
-    回傳 (rep_close[step], ohlc_dict or None)
-    """
     step = args.step
 
-    # auto-calibrate
     calib = auto_calibrate(
         full_df_up_to_now["Close"].values.astype(float),
         theta,
@@ -106,30 +96,26 @@ def _run_one_step(
         garch_model=args.garch_model,
     )
 
-    intra_bar      = calib["intra_bar"]
-    shadow_noise   = calib["shadow_noise"]
-    shadow_clamp   = calib["shadow_clamp"]
-    momentum_boost = calib["momentum_boost"]
-    drift_decay    = calib["drift_decay"]
-    vol_multiplier = calib["vol_multiplier"]
-    drift_scale    = calib["drift_scale"]
-    drift_clamp_max= calib["drift_clamp_max"]
+    intra_bar       = calib["intra_bar"]
+    momentum_boost  = calib["momentum_boost"]
+    drift_decay     = calib["drift_decay"]
+    vol_multiplier  = calib["vol_multiplier"]
+    drift_scale     = calib["drift_scale"]
+    drift_clamp_max = calib["drift_clamp_max"]
 
-    # backbone + blend_drift
-    fitter    = BackboneFitter(n_seg=6, smooth_reg=0.5)
-    bb_result = fitter.fit(close_hist)
+    fitter     = BackboneFitter(n_seg=6, smooth_reg=0.5)
+    bb_result  = fitter.fit(close_hist)
     last_drift = float(bb_result.segment_drifts[-1])
     last_vol   = float(bb_result.segment_vols[-1])
 
-    log_rets   = np.diff(np.log(close_hist))
-    short_drift= float(np.mean(log_rets[-5:])) if len(log_rets) >= 5 else last_drift
-    w          = float(np.clip(args.short_drift_weight, 0.0, 1.0))
-    blend_drift= float(np.clip(
+    log_rets    = np.diff(np.log(close_hist))
+    short_drift = float(np.mean(log_rets[-5:])) if len(log_rets) >= 5 else last_drift
+    w           = float(np.clip(args.short_drift_weight, 0.0, 1.0))
+    blend_drift = float(np.clip(
         w * short_drift + (1.0 - w) * last_drift,
         -drift_clamp_max, drift_clamp_max
     ))
 
-    # 支撐壓力修正
     start_price = float(close_hist[-1])
     if not args.no_sr:
         drift_adj, _ = compute_sr_drift_adjustment(
@@ -146,12 +132,10 @@ def _run_one_step(
             blend_drift + drift_adj, -drift_clamp_max, drift_clamp_max
         ))
 
-    # backbone forward（供 mean-revert 參考）
     drift_fwd = np.full(step, blend_drift)
     bb_fwd    = start_price * np.cumprod(1 + drift_fwd)
     vol_fwd   = np.full(step, last_vol) * vol_multiplier
 
-    # drift schedule（動態或靜態）
     if args.dynamic_drift:
         drift_schedule, _ = dynamic_drift_schedule(
             close_hist=close_hist,
@@ -168,31 +152,29 @@ def _run_one_step(
             momentum_signal=short_drift,
         )
     else:
-        fast_decay    = min(drift_decay * 2.0, 0.99)
-        cur           = blend_drift
-        drift_schedule= np.empty(step)
+        fast_decay     = min(drift_decay * 2.0, 0.99)
+        cur            = blend_drift
+        drift_schedule = np.empty(step)
         for t in range(step):
             drift_schedule[t] = cur
             cur *= (1.0 - (fast_decay if t < args.early_decay_bars else drift_decay))
 
-    # estimator + simulator
     ESTIMATOR_LB = 500
     rv_window  = min(21, len(close_hist))
     rv         = float(np.std(np.diff(np.log(close_hist[-rv_window:]))))
     vol_scale  = float(np.clip(rv / max(theta.vol, 1e-8), 0.6, 4.0))
 
-    est_df     = full_df_up_to_now.iloc[-ESTIMATOR_LB:]
-    estimator  = MarketParameterEstimator(lookback=ESTIMATOR_LB, vp_bins=40, momentum_window=10)
-    base_params= estimator.fit(est_df, symbol="")
-    params_fwd = build_params_from_theta(theta, base_params)
+    est_df      = full_df_up_to_now.iloc[-ESTIMATOR_LB:]
+    estimator   = MarketParameterEstimator(lookback=ESTIMATOR_LB, vp_bins=40, momentum_window=10)
+    base_params = estimator.fit(est_df, symbol="")
+    params_fwd  = build_params_from_theta(theta, base_params)
 
     import dataclasses
     params_fwd = dataclasses.replace(params_fwd, last_close=start_price)
 
-    momentum_bias = float(getattr(params_fwd, "momentum_bias", 0.0))
     if blend_drift < 0 and len(log_rets) >= args.reversal_window:
         if all(r > 0 for r in log_rets[-args.reversal_window:]):
-            momentum_bias = 0.0
+            params_fwd = dataclasses.replace(params_fwd, momentum_bias=0.0)
 
     sim = USStockFutureSimulator(
         params=params_fwd,
@@ -234,66 +216,58 @@ def rolling_forward(
     args,
     actual_future_df: pd.DataFrame | None = None,
 ) -> dict:
-    """
-    從 train_end_idx 開始，每輪預測 step 根、然後用真實 K 棒推進。
-    若 actual_future_df 不足，就用預測值填充（純未來模式）。
-
-    回傳 result dict 含：
-        pred_closes  : np.ndarray (total_bars,)
-        pred_ohlcs   : list of dict
-        actual_closes: np.ndarray or None
-        round_details: list of per-round dicts
-    """
     step       = args.step
     total_bars = args.total_bars
     lookback   = args.lookback
 
     pred_closes  : list[float] = []
-    pred_ohlcs   : list[dict]  = []   # 每輪一個 dict
+    pred_ohlcs   : list[dict]  = []
     round_details: list[dict]  = []
 
-    # 滑動「訓練尾端」指標（在 df 中的絕對位置）
-    cur_end = train_end_idx
-
-    rounds = int(np.ceil(total_bars / step))
+    cur_end   = train_end_idx
+    rounds    = int(np.ceil(total_bars / step))
     bars_done = 0
+
+    # 每輪的「真實起點」：計算 per-bar dir 用
+    actual_prev_closes: list[float] = []
 
     for rnd in range(rounds):
         need = min(step, total_bars - bars_done)
         if need <= 0:
             break
 
-        # 訓練窗口
-        win_start  = max(0, cur_end - lookback)
-        close_hist = df.iloc[win_start:cur_end]["Close"].values.astype(float)
-        full_window= df.iloc[max(0, cur_end - 500): cur_end].copy()
+        win_start   = max(0, cur_end - lookback)
+        close_hist  = df.iloc[win_start:cur_end]["Close"].values.astype(float)
+        full_window = df.iloc[max(0, cur_end - 500): cur_end].copy()
 
         if len(close_hist) < 10:
             break
 
-        start_price = float(close_hist[-1])
+        start_price = float(close_hist[-1])   # 本輪真實起點收盤
         print(f"  [輪 {rnd+1}/{rounds}]  訓練截至 idx={cur_end-1}  起點={start_price:.2f}  預測 {need} 根")
 
         rep, ohlc = _run_one_step(close_hist, theta, args, full_window)
-        rep  = rep[:need]
+        rep = rep[:need]
         if ohlc is not None:
             ohlc = {k: v[:need] for k, v in ohlc.items()}
 
-        # 本輪 actual（有的話）
+        # 本輪 actual
         actual_slice: np.ndarray | None = None
         if actual_future_df is not None:
             sl = actual_future_df.iloc[bars_done: bars_done + need]
             if len(sl) > 0:
                 actual_slice = sl["Close"].values.astype(float)
 
-        # 計算本輪誤差
+        # 「前一根真實」序列：[start_price, actual_0, actual_1, ...actual_{need-2}]
         if actual_slice is not None and len(actual_slice) == need:
-            mae_pct = float(np.mean(
+            prev_actual_for_dir = np.concatenate([[start_price], actual_slice[:-1]])
+            # MAE、方向命中 — 統一基準：兩者都相對「前一根真實收盤」
+            mae_pct  = float(np.mean(
                 np.abs(rep - actual_slice) / start_price * 100
             ))
-            dir_hits = int(np.sum(
-                np.sign(rep - start_price) == np.sign(actual_slice - start_price)
-            ))
+            p_rets   = rep - prev_actual_for_dir          # 預測漲跨幅
+            a_rets   = actual_slice - prev_actual_for_dir  # 實際漲跨幅
+            dir_hits = int(np.sum(np.sign(p_rets) == np.sign(a_rets)))
         else:
             mae_pct  = None
             dir_hits = None
@@ -310,18 +284,18 @@ def rolling_forward(
 
         pred_closes.extend(rep.tolist())
         pred_ohlcs.append(ohlc)
-
-        # 推進 cur_end：優先用真實 K 棒，不夠就用預測值
-        if actual_future_df is not None and len(actual_future_df) > bars_done + need - 1:
-            # 用真實資料推進 df（只更新指標）
-            cur_end += need
+        # 記錄本輪的「前一根真實」序列（後面 print 用）
+        if actual_slice is not None and len(actual_slice) == need:
+            actual_prev_closes.extend(
+                np.concatenate([[start_price], actual_slice[:-1]]).tolist()
+            )
         else:
-            # 純未來：把預測值臨時插入 df
-            cur_end += need
+            actual_prev_closes.extend([None] * need)
 
+        cur_end   += need
         bars_done += need
 
-    pred_arr = np.array(pred_closes)
+    pred_arr  = np.array(pred_closes)
     actual_arr: np.ndarray | None = None
     if actual_future_df is not None and len(actual_future_df) >= total_bars:
         actual_arr = actual_future_df.iloc[:total_bars]["Close"].values.astype(float)
@@ -329,10 +303,11 @@ def rolling_forward(
         actual_arr = actual_future_df["Close"].values.astype(float)
 
     return {
-        "pred_closes":   pred_arr,
-        "pred_ohlcs":    pred_ohlcs,
-        "actual_closes": actual_arr,
-        "round_details": round_details,
+        "pred_closes":         pred_arr,
+        "pred_ohlcs":          pred_ohlcs,
+        "actual_closes":       actual_arr,
+        "actual_prev_closes":  actual_prev_closes,   # 新增：每根的前一根真實收盤
+        "round_details":       round_details,
     }
 
 
@@ -354,18 +329,16 @@ def render_rolling(
 
     fig, ax = plt.subplots(figsize=(16, 6))
 
-    # 歷史
     hist_x = np.arange(-len(hist_close), 0)
     ax.plot(hist_x, hist_close, color="#555", lw=1.2, label="歷史", zorder=4)
 
-    # 預測 K 棒（每輪一個顏色循環）
     palette = ["#26A69A", "#42A5F5", "#AB47BC", "#FF7043", "#66BB6A", "#FFA726"]
     for rnd_i, ohlc in enumerate(ohlcs):
         start_bar = rnd_i * step
-        n = min(step, total - start_bar)
-        x_arr = np.arange(start_bar, start_bar + n)
-        bull = palette[rnd_i % len(palette)]
-        bear = _darken(bull)
+        n         = min(step, total - start_bar)
+        x_arr     = np.arange(start_bar, start_bar + n)
+        bull      = palette[rnd_i % len(palette)]
+        bear      = _darken(bull)
 
         if ohlc is not None:
             o = ohlc["open"][:n]
@@ -373,29 +346,27 @@ def render_rolling(
             l = ohlc["low"][:n]
             c = ohlc["close"][:n]
         else:
-            c = pred[start_bar: start_bar + n]
+            c    = pred[start_bar: start_bar + n]
             prev = hist_close[-1] if start_bar == 0 else pred[start_bar - 1]
-            o = np.concatenate([[prev], c[:-1]])
-            sp = c * 0.005
-            h = np.maximum(o, c) + sp
-            l = np.minimum(o, c) - sp
+            o    = np.concatenate([[prev], c[:-1]])
+            sp   = c * 0.005
+            h    = np.maximum(o, c) + sp
+            l    = np.minimum(o, c) - sp
 
         _draw_candles(ax, x_arr, o, h, l, c,
                       bull_color=bull, bear_color=bear, alpha=0.85)
 
-        # 輪次分隔線（除第一輪）
         if rnd_i > 0:
             ax.axvline(start_bar, color="#888", lw=0.6, ls=":", alpha=0.6)
 
-    # 實際收盤
     if actual is not None and len(actual) > 0:
         ax.plot(np.arange(len(actual)), actual,
                 color="#43A047", lw=1.8, ls="--", label="實際收盤", zorder=6)
 
-    # 輪次標籤
     for rnd_i in range(len(ohlcs)):
         x_mid = rnd_i * step + step / 2
-        ax.text(x_mid, ax.get_ylim()[1] * 0.99 if ax.get_ylim()[1] > 0 else 1,
+        ylim  = ax.get_ylim()
+        ax.text(x_mid, ylim[1] - (ylim[1] - ylim[0]) * 0.02,
                 f"R{rnd_i+1}", ha="center", va="top",
                 fontsize=7, color="#555", alpha=0.8)
 
@@ -406,31 +377,30 @@ def render_rolling(
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # ── 下方子圖：每輪 MAE ──
-    round_details = result["round_details"]
-    maes   = [r["mae_pct"] for r in round_details if r["mae_pct"] is not None]
-    rounds_with_mae = [r["round"] for r in round_details if r["mae_pct"] is not None]
+    round_details   = result["round_details"]
+    maes            = [r["mae_pct"] for r in round_details if r["mae_pct"] is not None]
+    rounds_with_mae = [r["round"]   for r in round_details if r["mae_pct"] is not None]
 
     if maes:
         fig2, ax2 = plt.subplots(figsize=(10, 3))
-        colors2   = ["#EF5350" if m > np.mean(maes) else "#26A69A" for m in maes]
+        avg       = np.mean(maes)
+        colors2   = ["#EF5350" if m > avg else "#26A69A" for m in maes]
         ax2.bar(rounds_with_mae, maes, color=colors2, alpha=0.8, width=0.6)
-        ax2.axhline(np.mean(maes), color="#888", lw=1, ls="--",
-                    label=f"平均 MAE={np.mean(maes):.2f}%")
+        ax2.axhline(avg, color="#888", lw=1, ls="--",
+                    label=f"平均 MAE={avg:.2f}%")
         ax2.set_title(f"{symbol}  每輪 MAE (close)")
         ax2.set_xlabel("輪次")
         ax2.set_ylabel("MAE %")
         ax2.legend(fontsize=8)
         ax2.grid(True, alpha=0.3)
-
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        mae_path = out / f"{symbol}_{end_date_str}_rolling{step}_mae.png"
+        out2 = Path(output_dir)
+        out2.mkdir(parents=True, exist_ok=True)
+        mae_path = out2 / f"{symbol}_{end_date_str}_rolling{step}_mae.png"
         fig2.savefig(mae_path, dpi=150, bbox_inches="tight")
         plt.close(fig2)
         print(f"✔ MAE 圖 → {mae_path}")
 
-    out   = Path(output_dir)
+    out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     fname = out / f"{symbol}_{end_date_str}_rolling{step}.png"
     fig.savefig(fname, dpi=150, bbox_inches="tight")
@@ -440,7 +410,6 @@ def render_rolling(
 
 
 def _darken(hex_color: str, factor: float = 0.65) -> str:
-    """把 #RRGGBB 加深（用於熊線）"""
     h = hex_color.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return "#{:02x}{:02x}{:02x}".format(
@@ -449,7 +418,7 @@ def _darken(hex_color: str, factor: float = 0.65) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OHLC 對照表（滾動版）
+# Terminal 對照表
 # ──────────────────────────────────────────────────────────────────────────────
 def print_rolling_comparison(
     result: dict,
@@ -457,71 +426,80 @@ def print_rolling_comparison(
     symbol: str,
     step: int,
 ):
-    pred   = result["pred_closes"]
-    actual = result["actual_closes"]
-    ohlcs  = result["pred_ohlcs"]
-    n      = len(pred)
+    """
+    方向命中定義（v2）：兩者都相對「前一根真實收盤」
+      P-Ret = (pred_t   - actual_{t-1}) / actual_{t-1}
+      A-Ret = (actual_t - actual_{t-1}) / actual_{t-1}
+      Dir   = sign(P-Ret) == sign(A-Ret)
+    """
+    pred              = result["pred_closes"]
+    actual            = result["actual_closes"]
+    actual_prev_arr   = result.get("actual_prev_closes", [])
+    n                 = len(pred)
 
-    sep = "─" * 80
+    sep = "─" * 84
     print(f"\n{sep}")
     print(f"  Rolling {step}-bar Forward  —  {symbol}  (共 {n} 根 K 棒)")
+    print(f"  Dir 定義: sign(pred - prev_actual) == sign(actual - prev_actual)")
     print(sep)
     hdr = (f"  {'Rnd':>3} {'Bar':>3}  "
            f"{'P-Close':>8} {'P-Ret%':>7}  "
            f"{'A-Close':>8} {'A-Ret%':>7}  "
            f"{'Err%':>7} {'Dir':>3}")
     print(hdr)
-    print("─" * 80)
+    print("─" * 84)
 
-    prev_p = start_price
-    prev_a = start_price
-    global_i = 0
-    close_errs = []
+    global_i    = 0
+    close_errs  = []
     dir_correct = 0
+    total_bars_with_actual = 0
 
     for rnd_i, rnd in enumerate(result["round_details"]):
         bars_this = rnd["bars"]
         for b in range(bars_this):
-            p_c = float(pred[global_i])
-            p_ret = (p_c - prev_p) / prev_p * 100
+            p_c      = float(pred[global_i])
+            prev_act = float(actual_prev_arr[global_i]) if global_i < len(actual_prev_arr) and actual_prev_arr[global_i] is not None else None
+
+            # P-Ret 相對前一根真實收盤
+            p_ret = (p_c - prev_act) / prev_act * 100 if prev_act else float("nan")
 
             if actual is not None and global_i < len(actual):
                 a_c   = float(actual[global_i])
-                a_ret = (a_c - prev_a) / prev_a * 100
+                a_ret = (a_c - prev_act) / prev_act * 100 if prev_act else float("nan")
                 err   = (p_c - a_c) / a_c * 100
                 close_errs.append(abs(err))
-                p_dir = "+" if p_c >= prev_p else "-"
-                a_dir = "+" if a_c >= prev_a else "-"
-                match = "✓" if p_dir == a_dir else "✗"
-                if p_dir == a_dir:
+                total_bars_with_actual += 1
+
+                p_up  = p_ret >= 0
+                a_up  = a_ret >= 0
+                match = "✓" if p_up == a_up else "✗"
+                if p_up == a_up:
                     dir_correct += 1
+
                 print(f"  {rnd_i+1:>3} {b+1:>3}  "
                       f"{p_c:>8.2f} {p_ret:>+7.2f}%  "
                       f"{a_c:>8.2f} {a_ret:>+7.2f}%  "
                       f"{err:>+7.2f}% {match:>3}")
-                prev_a = a_c
             else:
                 print(f"  {rnd_i+1:>3} {b+1:>3}  "
                       f"{p_c:>8.2f} {p_ret:>+7.2f}%  "
                       f"{'N/A':>8} {'N/A':>7}  "
                       f"{'N/A':>7} {'N/A':>3}")
-            prev_p = p_c
             global_i += 1
 
-        # 輪次小計線
-        if actual is not None and global_i <= len(actual):
-            rnd_mae = rnd.get("mae_pct")
-            rnd_dir = rnd.get("dir_hits")
-            if rnd_mae is not None:
-                print(f"  {'':>7}  → 本輪 MAE={rnd_mae:.2f}%  方向命中={rnd_dir}/{bars_this}")
-        print("  " + "·" * 40)
+        # 本輪小計（用 round_details 已存的 per-round 資料）
+        rnd_mae = rnd.get("mae_pct")
+        rnd_dir = rnd.get("dir_hits")
+        if rnd_mae is not None:
+            print(f"  {'':>7}  → 本輪 MAE={rnd_mae:.2f}%  方向命中={rnd_dir}/{bars_this}")
+        print("  " + "·" * 42)
 
     print(sep)
     if close_errs:
-        total_n = len(close_errs)
-        print(f"  合計 {total_n} 根  MAE={np.mean(close_errs):.2f}%  "
+        tn = total_bars_with_actual
+        print(f"  合計 {tn} 根  MAE={np.mean(close_errs):.2f}%  "
               f"MAX={np.max(close_errs):.2f}%  "
-              f"方向命中={dir_correct}/{total_n} ({dir_correct/total_n*100:.0f}%)")
+              f"方向命中={dir_correct}/{tn} ({dir_correct/tn*100:.0f}%)")
     print(sep + "\n")
 
 
@@ -530,40 +508,34 @@ def print_rolling_comparison(
 # ──────────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--symbol",         required=True)
-    p.add_argument("--theta",          required=True)
-    p.add_argument("--end-date",       default=None,
-                   help="預測起點日期 (YYYY-MM-DD)，不填則用今日")
-    p.add_argument("--total-bars",     type=int, default=30,
-                   help="總共要預測幾根 K 棒 (預設 30)")
-    p.add_argument("--step",           type=int, default=5,
-                   help="每輪預測幾根，然後用真實 K 棒推進 (預設 5)")
-    p.add_argument("--lookback",       type=int, default=120)
-    p.add_argument("--n-paths",        type=int, default=500)
-    p.add_argument("--calib-window",   type=int, default=500)
-    p.add_argument("--no-garch",        action="store_true")
-    p.add_argument("--garch-model",    default="gjr-garch",
+    p.add_argument("--symbol",              required=True)
+    p.add_argument("--theta",               required=True)
+    p.add_argument("--end-date",            default=None)
+    p.add_argument("--total-bars",          type=int,   default=30)
+    p.add_argument("--step",                type=int,   default=5)
+    p.add_argument("--lookback",            type=int,   default=120)
+    p.add_argument("--n-paths",             type=int,   default=500)
+    p.add_argument("--calib-window",        type=int,   default=500)
+    p.add_argument("--no-garch",            action="store_true")
+    p.add_argument("--garch-model",         default="gjr-garch",
                    choices=["gjr-garch", "garch"])
-    p.add_argument("--auto-calibrate",  action="store_true", default=True)
-    p.add_argument("--output-dir",     default="results")
-    p.add_argument("--verbose",         action="store_true")
-    p.add_argument("--short-drift-weight", type=float, default=0.4)
-    # 支撐壓力
-    p.add_argument("--sr-window",      type=int,   default=90)
-    p.add_argument("--sr-bins",        type=int,   default=40)
-    p.add_argument("--sr-top-k",       type=int,   default=5)
-    p.add_argument("--sr-pivot-order", type=int,   default=5)
-    p.add_argument("--sr-zone-pct",    type=float, default=0.035)
-    p.add_argument("--no-sr",           action="store_true")
-    # 動態 drift
-    p.add_argument("--dynamic-drift",   action="store_true", default=True)
-    p.add_argument("--no-dynamic-drift", dest="dynamic_drift", action="store_false")
-    p.add_argument("--mr-rate",        type=float, default=0.08)
-    p.add_argument("--trend-strength", type=float, default=0.5)
-    p.add_argument("--vol-refit",      type=int,   default=5)
-    p.add_argument("--early-decay-bars", type=int, default=5,
-                   help="rolling 模式建議 5 (等於 step)")
-    p.add_argument("--reversal-window", type=int,  default=3)
+    p.add_argument("--auto-calibrate",      action="store_true", default=True)
+    p.add_argument("--output-dir",          default="results")
+    p.add_argument("--verbose",             action="store_true")
+    p.add_argument("--short-drift-weight",  type=float, default=0.4)
+    p.add_argument("--sr-window",           type=int,   default=90)
+    p.add_argument("--sr-bins",             type=int,   default=40)
+    p.add_argument("--sr-top-k",            type=int,   default=5)
+    p.add_argument("--sr-pivot-order",      type=int,   default=5)
+    p.add_argument("--sr-zone-pct",         type=float, default=0.035)
+    p.add_argument("--no-sr",               action="store_true")
+    p.add_argument("--dynamic-drift",       action="store_true", default=True)
+    p.add_argument("--no-dynamic-drift",    dest="dynamic_drift", action="store_false")
+    p.add_argument("--mr-rate",             type=float, default=0.08)
+    p.add_argument("--trend-strength",      type=float, default=0.5)
+    p.add_argument("--vol-refit",           type=int,   default=5)
+    p.add_argument("--early-decay-bars",    type=int,   default=5)
+    p.add_argument("--reversal-window",     type=int,   default=3)
     return p.parse_args()
 
 
@@ -603,11 +575,10 @@ def main():
         raise ValueError(f"找不到 {end_dt.date()} 之前的資料")
     train_end_idx = int(mask.values.nonzero()[0][-1]) + 1
 
-    future_df = df.iloc[train_end_idx: train_end_idx + args.total_bars].copy()
-    train_df  = df.iloc[train_end_idx - args.lookback: train_end_idx]
-    hist_close= train_df["Close"].values.astype(float)
-    start_price = float(hist_close[-1])
-
+    future_df        = df.iloc[train_end_idx: train_end_idx + args.total_bars].copy()
+    train_df         = df.iloc[train_end_idx - args.lookback: train_end_idx]
+    hist_close       = train_df["Close"].values.astype(float)
+    start_price      = float(hist_close[-1])
     actual_future_df = future_df if len(future_df) > 0 else None
 
     end_date_str = end_dt.strftime("%Y-%m-%d")
@@ -643,24 +614,44 @@ def main():
     out_path = Path(args.output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     summary = {
-        "symbol":       args.symbol,
-        "end_date":     end_date_str,
-        "step":         args.step,
-        "total_bars":   args.total_bars,
-        "start_price":  round(start_price, 4),
+        "symbol":        args.symbol,
+        "end_date":      end_date_str,
+        "step":          args.step,
+        "total_bars":    args.total_bars,
+        "start_price":   round(start_price, 4),
         "round_details": result["round_details"],
         "dynamic_drift": args.dynamic_drift,
+        "dir_definition": "sign(pred-prev_actual)==sign(actual-prev_actual)",
     }
+
     if result["actual_closes"] is not None:
         pred   = result["pred_closes"]
         actual = result["actual_closes"]
-        na     = min(len(pred), len(actual))
-        mae    = float(np.mean(np.abs(pred[:na] - actual[:na]) / start_price * 100))
-        dirs   = int(np.sum(np.sign(pred[:na] - start_price) ==
-                            np.sign(actual[:na] - start_price)))
-        summary["overall_mae_pct"]   = round(mae, 4)
-        summary["dir_accuracy_pct"]  = round(dirs / na * 100, 2)
-        print(f"\n  整體 MAE={mae:.2f}%   方向命中={dirs}/{na} ({dirs/na*100:.0f}%)")
+        prev_a = result["actual_prev_closes"]
+        na     = min(len(pred), len(actual), len(prev_a))
+
+        # MAE
+        mae = float(np.mean(
+            np.abs(pred[:na] - actual[:na]) / start_price * 100
+        ))
+
+        # 方向命中：統一定義
+        p_rets = np.array([
+            pred[i] - prev_a[i]
+            for i in range(na)
+            if prev_a[i] is not None
+        ])
+        a_rets = np.array([
+            actual[i] - prev_a[i]
+            for i in range(na)
+            if prev_a[i] is not None
+        ])
+        valid_n = len(p_rets)
+        dirs    = int(np.sum(np.sign(p_rets) == np.sign(a_rets)))
+
+        summary["overall_mae_pct"]  = round(mae, 4)
+        summary["dir_accuracy_pct"] = round(dirs / valid_n * 100, 2) if valid_n > 0 else None
+        print(f"\n  整體 MAE={mae:.2f}%   方向命中={dirs}/{valid_n} ({dirs/valid_n*100:.0f}%)")
 
     json_path = out_path / f"{args.symbol}_{end_date_str}_rolling{args.step}.json"
     with open(json_path, "w") as fj:
