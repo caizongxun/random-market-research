@@ -17,6 +17,11 @@ Example:
         --maxiter 600 \\
         --backbone-mr 0.06 \\
         --output calibrated_theta_aapl.json
+
+    # 指定截止日（避免 data leakage）
+    python scripts/calibrate_params.py \\
+        --symbol AAPL --end-date 2025-06-01 \\
+        --output calibrated_theta_aapl.json
 """
 
 from __future__ import annotations
@@ -45,6 +50,9 @@ DARK = "#0e0e0e"
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--symbol",      required=True)
+    p.add_argument("--end-date",    default=None,
+                   help="資料截止日 YYYY-MM-DD（含），未指定則用今日。"
+                        "設定此值可避免 rolling test 的 data leakage。")
     p.add_argument("--period",      default="3y")
     p.add_argument("--interval",    default="1d")
     p.add_argument("--lookback",    type=int,   default=120)
@@ -102,11 +110,30 @@ def auto_vol_scale(segment_vols: np.ndarray, theta_vol: float) -> float:
 def main():
     args = parse_args()
 
+    # 決定下載的時間範圍
+    # --end-date 有值時以該日為上界（含），避免 data leakage；
+    # 否則沿用 period="3y" 的舊行為。
+    end_dt = pd.Timestamp(args.end_date) if args.end_date else None
+
     print(f"[1/4] Downloading {args.symbol}...")
-    df_raw = yf.download(
-        args.symbol, period=args.period, interval=args.interval,
-        auto_adjust=False, progress=False,
-    )
+    if end_dt is not None:
+        start_dt = end_dt - pd.DateOffset(years=int(args.period.rstrip("y")) if args.period.endswith("y") else 3)
+        # yfinance end 為不含，故 +1 day
+        dl_end = (end_dt + pd.DateOffset(days=1)).strftime("%Y-%m-%d")
+        dl_start = start_dt.strftime("%Y-%m-%d")
+        print(f"      範圍：{dl_start} → {args.end_date}（end-date 截止）")
+        df_raw = yf.download(
+            args.symbol,
+            start=dl_start,
+            end=dl_end,
+            interval=args.interval,
+            auto_adjust=False, progress=False,
+        )
+    else:
+        df_raw = yf.download(
+            args.symbol, period=args.period, interval=args.interval,
+            auto_adjust=False, progress=False,
+        )
     df = ensure_ohlcv(df_raw)
     print(f"      Total bars: {len(df)}")
 
