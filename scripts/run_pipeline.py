@@ -185,9 +185,15 @@ def step1_download(sym: str, end_date: str | None, cache_hours: float, force: bo
 
             if macro_frames:
                 macro_df = pd.concat(macro_frames.values(), axis=1)
+                # fix: 保留 DatetimeIndex 存入 parquet，避免讀回後 index 變 1970-01-01
+                # reset_index() 後用 set_index("Date") 確保 index 是正確的 DatetimeIndex
                 macro_df.index = pd.to_datetime(macro_df.index)
-                macro_df = macro_df.sort_index().reset_index().rename(columns={"index": "Date"})
-                macro_df.to_parquet(macro_out, index=False)
+                macro_df = macro_df.sort_index()
+                # 統一去除時區，避免 tz-aware vs tz-naive 比較問題
+                if macro_df.index.tz is not None:
+                    macro_df.index = macro_df.index.tz_convert(None)
+                macro_df.index.name = "Date"
+                macro_df.to_parquet(macro_out, index=True)  # index=True 保留 DatetimeIndex
                 print(f"  ✔ Macro ({list(macro_frames.keys())}) → {macro_out}")
             else:
                 print("  [WARN] Macro 全部失敗，略過 macro.parquet")
