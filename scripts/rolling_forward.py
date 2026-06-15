@@ -33,6 +33,17 @@ rolling_forward.py
     --step 5 \\
     --auto-calibrate \\
     --verbose
+
+  # 加入參數模型覆蓋 drift_scale / drift_decay：
+  python scripts/rolling_forward.py \\
+    --symbol AAPL \\
+    --theta results/theta_aapl.json \\
+    --end-date 2025-01-01 \\
+    --total-bars 30 \\
+    --step 5 \\
+    --auto-calibrate \\
+    --param-model models/param_model_AAPL.joblib \\
+    --verbose
 """
 
 from __future__ import annotations
@@ -78,6 +89,159 @@ except ImportError:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 參數模型載入（optional）
+# ──────────────────────────────────────────────────────────────────────────────
+def load_param_model(path: str | None):
+    """載入 joblib 封裝的參數模型。若 path 為 None 回傳 None。"""
+    if path is None:
+        return None
+    try:
+        import joblib
+    except ImportError:
+        raise ImportError("需要 joblib：pip install joblib")
+    payload = joblib.load(path)
+    print(f"[param-model] 載入 {path}  "
+          f"({payload['model_name']}, n_feat={len(payload['feature_cols'])})")
+    return payload
+
+
+# 複製自 collect_training_data.py 的特徵提取
+def _garch_features(close_arr):
+    try:
+        from arch import arch_model
+        rets = pd.Series(np.diff(np.log(close_arr)) * 100).dropna()
+        if len(rets) < 60:
+            return {}
+        am  = arch_model(rets, vol="Garch", p=1, o=1, q=1, dist="t")
+        res = am.fit(disp="off", show_warning=False)
+        p   = res.params
+        alpha = float(p.get("alpha[1]", 0))
+        gamma = float(p.get("gamma[1]", 0))
+        beta  = float(p.get("beta[1]",  0))
+        fc    = res.forecast(horizon=1, reindex=False)
+        fvol  = float(np.sqrt(fc.variance.values[-1, 0])) / 100
+        return {
+            "garch_alpha":        round(alpha, 4),
+            "garch_gamma":        round(gamma, 4),
+            "garch_beta":         round(beta, 4),
+            "garch_persistence":  round(alpha + beta + 0.5 * gamma, 4),
+            "garch_forecast_vol": round(fvol * 100, 4),
+        }
+    except Exception:
+        return {}
+
+
+def _extract_features(df_window: pd.DataFrame, theta_vol: float) -> dict:
+    """與 collect_training_data.py 完全一致的特徵提取。"""
+    c = df_window["Close"].values.astype(float)
+    o = df_window["Open"].values.astype(float)
+    h = df_window["High"].values.astype(float)
+    l = df_window["Low"].values.astype(float)
+    v = df_window["Volume"].values.astype(float)
+
+    log_rets = np.diff(np.log(c))
+
+    vol_20  = float(np.std(log_rets[-20:])) if len(log_rets) >= 20 else float(np.std(log_rets))
+    vol_60  = float(np.std(log_rets[-60:])) if len(log_rets) >= 60 else float(np.std(log_rets))
+    vol_all = float(np.std(log_rets))
+
+    drift_20  = float(np.mean(log_rets[-20:])) if len(log_rets) >= 20 else float(np.mean(log_rets))
+    drift_60  = float(np.mean(log_rets[-60:])) if len(log_rets) >= 60 else float(np.mean(log_rets))
+    drift_all = float(np.mean(log_rets))
+
+    s = pd.Series(log_rets)
+    ret_autocorr = float(s.autocorr(lag=1)) if len(s) > 10 else 0.0
+    ret_autocorr = 0.0 if np.isnan(ret_autocorr) else ret_autocorr
+
+    vret = pd.Series(v).pct_change().dropna()
+    vol_autocorr = float(vret.autocorr(lag=1)) if len(vret) > 10 else 0.0
+    vol_autocorr = max(0.0, 0.0 if np.isnan(vol_autocorr) else vol_autocorr)
+
+    body_pct  = np.abs(c - o) / (o + 1e-8)
+    avg_body  = float(np.mean(body_pct))
+    body_size = np.abs(c - o) + 1e-8
+    sr        = (h - l) / body_size
+    median_sr = float(np.median(sr))
+    p90_sr    = float(np.percentile(sr, 90))
+
+    try:
+        fitter = BackboneFitter(n_seg=6, smooth_reg=0.5)
+        bb = fitter.fit(c[-120:] if len(c) >= 120 else c)
+        bb_last_drift = float(bb.segment_drifts[-1])
+        bb_last_vol   = float(bb.segment_vols[-1])
+        bb_drift_std  = float(np.std(bb.segment_drifts))
+        bb_vol_std    = float(np.std(bb.segment_vols))
+    except Exception:
+        bb_last_drift = drift_all
+        bb_last_vol   = vol_all
+        bb_drift_std  = 0.0
+        bb_vol_std    = 0.0
+
+    feat = {
+        "vol_20":             round(vol_20 * 100, 4),
+        "vol_60":             round(vol_60 * 100, 4),
+        "vol_all":            round(vol_all * 100, 4),
+        "vol_ratio_20_60":    round(vol_20 / (vol_60 + 1e-8), 4),
+        "vol_ratio_rv_theta": round(vol_20 / (theta_vol + 1e-8), 4),
+        "drift_20":           round(drift_20 * 100, 4),
+        "drift_60":           round(drift_60 * 100, 4),
+        "drift_all":          round(drift_all * 100, 4),
+        "drift_ratio_20_all": round(
+            drift_20 / (abs(drift_all) + 1e-8) * np.sign(drift_all + 1e-12), 4
+        ),
+        "ret_autocorr":    round(ret_autocorr, 4),
+        "vol_autocorr":    round(vol_autocorr, 4),
+        "avg_body_pct":    round(avg_body * 100, 4),
+        "median_sr":       round(median_sr, 4),
+        "p90_sr":          round(p90_sr, 4),
+        "bb_last_drift":   round(bb_last_drift * 100, 4),
+        "bb_last_vol":     round(bb_last_vol * 100, 4),
+        "bb_drift_std":    round(bb_drift_std * 100, 4),
+        "bb_vol_std":      round(bb_vol_std * 100, 4),
+    }
+    feat.update(_garch_features(c))
+    return feat
+
+
+def apply_param_model(
+    payload,
+    df_window: pd.DataFrame,
+    theta_vol: float,
+    calib: dict,
+    verbose: bool = False,
+) -> dict:
+    """
+    用模型預測 drift_scale / drift_decay，覆蓋 auto_calibrate 輸出。
+    momentum_boost 保留 auto_calibrate 的值（模型 CV MAE≈0，無信號）。
+    """
+    if payload is None:
+        return calib
+
+    feats = _extract_features(df_window, theta_vol)
+    feature_cols = payload["feature_cols"]
+    models       = payload["models"]
+
+    # 對齊特徵順序，缺少的填 0
+    x = np.array([[feats.get(fc.replace("feat_", ""), 0.0) for fc in feature_cols]])
+
+    pred_ds = float(models["target_drift_scale"].predict(x)[0])
+    pred_dd = float(models["target_drift_decay"].predict(x)[0])
+
+    # 合理邊界防爆
+    pred_ds = float(np.clip(pred_ds, 0.2, 4.0))
+    pred_dd = float(np.clip(pred_dd, 0.01, 0.30))
+
+    if verbose:
+        print(f"    [param-model]  auto: ds={calib['drift_scale']:.3f}  dd={calib['drift_decay']:.3f}"
+              f"  →  model: ds={pred_ds:.3f}  dd={pred_dd:.3f}")
+
+    updated = dict(calib)
+    updated["drift_scale"]  = pred_ds
+    updated["drift_decay"]  = pred_dd
+    return updated
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 單輪預測
 # ──────────────────────────────────────────────────────────────────────────────
 def _run_one_step(
@@ -85,6 +249,7 @@ def _run_one_step(
     theta: CalibratedTheta,
     args,
     full_df_up_to_now: pd.DataFrame,
+    param_model_payload=None,
 ) -> tuple[np.ndarray, dict | None]:
     step = args.step
 
@@ -95,6 +260,18 @@ def _run_one_step(
         use_garch=(not args.no_garch) and _ARCH_AVAILABLE,
         garch_model=args.garch_model,
     )
+
+    # ── 參數模型覆蓋 ──────────────────────────────────────────
+    if param_model_payload is not None:
+        calib_window_df = full_df_up_to_now.iloc[-args.calib_window:]
+        calib = apply_param_model(
+            param_model_payload,
+            calib_window_df,
+            theta.vol,
+            calib,
+            verbose=getattr(args, "verbose", False),
+        )
+    # ─────────────────────────────────────────────────────────
 
     intra_bar       = calib["intra_bar"]
     momentum_boost  = calib["momentum_boost"]
@@ -215,6 +392,7 @@ def rolling_forward(
     theta: CalibratedTheta,
     args,
     actual_future_df: pd.DataFrame | None = None,
+    param_model_payload=None,
 ) -> dict:
     step       = args.step
     total_bars = args.total_bars
@@ -228,7 +406,6 @@ def rolling_forward(
     rounds    = int(np.ceil(total_bars / step))
     bars_done = 0
 
-    # 每輪的「真實起點」：計算 per-bar dir 用
     actual_prev_closes: list[float] = []
 
     for rnd in range(rounds):
@@ -243,30 +420,30 @@ def rolling_forward(
         if len(close_hist) < 10:
             break
 
-        start_price = float(close_hist[-1])   # 本輪真實起點收盤
+        start_price = float(close_hist[-1])
         print(f"  [輪 {rnd+1}/{rounds}]  訓練截至 idx={cur_end-1}  起點={start_price:.2f}  預測 {need} 根")
 
-        rep, ohlc = _run_one_step(close_hist, theta, args, full_window)
+        rep, ohlc = _run_one_step(
+            close_hist, theta, args, full_window,
+            param_model_payload=param_model_payload,
+        )
         rep = rep[:need]
         if ohlc is not None:
             ohlc = {k: v[:need] for k, v in ohlc.items()}
 
-        # 本輪 actual
         actual_slice: np.ndarray | None = None
         if actual_future_df is not None:
             sl = actual_future_df.iloc[bars_done: bars_done + need]
             if len(sl) > 0:
                 actual_slice = sl["Close"].values.astype(float)
 
-        # 「前一根真實」序列：[start_price, actual_0, actual_1, ...actual_{need-2}]
         if actual_slice is not None and len(actual_slice) == need:
             prev_actual_for_dir = np.concatenate([[start_price], actual_slice[:-1]])
-            # MAE、方向命中 — 統一基準：兩者都相對「前一根真實收盤」
             mae_pct  = float(np.mean(
                 np.abs(rep - actual_slice) / start_price * 100
             ))
-            p_rets   = rep - prev_actual_for_dir          # 預測漲跨幅
-            a_rets   = actual_slice - prev_actual_for_dir  # 實際漲跨幅
+            p_rets   = rep - prev_actual_for_dir
+            a_rets   = actual_slice - prev_actual_for_dir
             dir_hits = int(np.sum(np.sign(p_rets) == np.sign(a_rets)))
         else:
             mae_pct  = None
@@ -284,7 +461,6 @@ def rolling_forward(
 
         pred_closes.extend(rep.tolist())
         pred_ohlcs.append(ohlc)
-        # 記錄本輪的「前一根真實」序列（後面 print 用）
         if actual_slice is not None and len(actual_slice) == need:
             actual_prev_closes.extend(
                 np.concatenate([[start_price], actual_slice[:-1]]).tolist()
@@ -303,11 +479,11 @@ def rolling_forward(
         actual_arr = actual_future_df["Close"].values.astype(float)
 
     return {
-        "pred_closes":         pred_arr,
-        "pred_ohlcs":          pred_ohlcs,
-        "actual_closes":       actual_arr,
-        "actual_prev_closes":  actual_prev_closes,   # 新增：每根的前一根真實收盤
-        "round_details":       round_details,
+        "pred_closes":        pred_arr,
+        "pred_ohlcs":         pred_ohlcs,
+        "actual_closes":      actual_arr,
+        "actual_prev_closes": actual_prev_closes,
+        "round_details":      round_details,
     }
 
 
@@ -321,6 +497,7 @@ def render_rolling(
     step: int,
     end_date_str: str,
     output_dir: str,
+    label_suffix: str = "",
 ):
     pred   = result["pred_closes"]
     actual = result["actual_closes"]
@@ -371,7 +548,8 @@ def render_rolling(
                 fontsize=7, color="#555", alpha=0.8)
 
     ax.axvline(0, color="#999", lw=0.8, ls=":")
-    ax.set_title(f"{symbol}  Rolling {step}-bar Forward  [{end_date_str}]")
+    suffix_display = f" [{label_suffix}]" if label_suffix else ""
+    ax.set_title(f"{symbol}  Rolling {step}-bar Forward  [{end_date_str}]{suffix_display}")
     ax.set_xlabel("交易日（相對預測起點）")
     ax.set_ylabel("價格")
     ax.legend(loc="upper left", fontsize=8)
@@ -388,21 +566,23 @@ def render_rolling(
         ax2.bar(rounds_with_mae, maes, color=colors2, alpha=0.8, width=0.6)
         ax2.axhline(avg, color="#888", lw=1, ls="--",
                     label=f"平均 MAE={avg:.2f}%")
-        ax2.set_title(f"{symbol}  每輪 MAE (close)")
+        ax2.set_title(f"{symbol}  每輪 MAE (close){suffix_display}")
         ax2.set_xlabel("輪次")
         ax2.set_ylabel("MAE %")
         ax2.legend(fontsize=8)
         ax2.grid(True, alpha=0.3)
         out2 = Path(output_dir)
         out2.mkdir(parents=True, exist_ok=True)
-        mae_path = out2 / f"{symbol}_{end_date_str}_rolling{step}_mae.png"
+        suffix_file = f"_{label_suffix}" if label_suffix else ""
+        mae_path = out2 / f"{symbol}_{end_date_str}_rolling{step}{suffix_file}_mae.png"
         fig2.savefig(mae_path, dpi=150, bbox_inches="tight")
         plt.close(fig2)
         print(f"✔ MAE 圖 → {mae_path}")
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    fname = out / f"{symbol}_{end_date_str}_rolling{step}.png"
+    suffix_file = f"_{label_suffix}" if label_suffix else ""
+    fname = out / f"{symbol}_{end_date_str}_rolling{step}{suffix_file}.png"
     fig.savefig(fname, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"✔ 預測圖 → {fname}")
@@ -425,21 +605,17 @@ def print_rolling_comparison(
     start_price: float,
     symbol: str,
     step: int,
+    label_suffix: str = "",
 ):
-    """
-    方向命中定義（v2）：兩者都相對「前一根真實收盤」
-      P-Ret = (pred_t   - actual_{t-1}) / actual_{t-1}
-      A-Ret = (actual_t - actual_{t-1}) / actual_{t-1}
-      Dir   = sign(P-Ret) == sign(A-Ret)
-    """
-    pred              = result["pred_closes"]
-    actual            = result["actual_closes"]
-    actual_prev_arr   = result.get("actual_prev_closes", [])
-    n                 = len(pred)
+    pred            = result["pred_closes"]
+    actual          = result["actual_closes"]
+    actual_prev_arr = result.get("actual_prev_closes", [])
+    n               = len(pred)
 
+    suffix_display = f" [{label_suffix}]" if label_suffix else ""
     sep = "─" * 84
     print(f"\n{sep}")
-    print(f"  Rolling {step}-bar Forward  —  {symbol}  (共 {n} 根 K 棒)")
+    print(f"  Rolling {step}-bar Forward  —  {symbol}  (共 {n} 根 K 棒){suffix_display}")
     print(f"  Dir 定義: sign(pred - prev_actual) == sign(actual - prev_actual)")
     print(sep)
     hdr = (f"  {'Rnd':>3} {'Bar':>3}  "
@@ -460,7 +636,6 @@ def print_rolling_comparison(
             p_c      = float(pred[global_i])
             prev_act = float(actual_prev_arr[global_i]) if global_i < len(actual_prev_arr) and actual_prev_arr[global_i] is not None else None
 
-            # P-Ret 相對前一根真實收盤
             p_ret = (p_c - prev_act) / prev_act * 100 if prev_act else float("nan")
 
             if actual is not None and global_i < len(actual):
@@ -487,7 +662,6 @@ def print_rolling_comparison(
                       f"{'N/A':>7} {'N/A':>3}")
             global_i += 1
 
-        # 本輪小計（用 round_details 已存的 per-round 資料）
         rnd_mae = rnd.get("mae_pct")
         rnd_dir = rnd.get("dir_hits")
         if rnd_mae is not None:
@@ -520,6 +694,8 @@ def parse_args():
     p.add_argument("--garch-model",         default="gjr-garch",
                    choices=["gjr-garch", "garch"])
     p.add_argument("--auto-calibrate",      action="store_true", default=True)
+    p.add_argument("--param-model",         default=None,
+                   help="joblib 模型路徑，覆蓋 drift_scale / drift_decay")
     p.add_argument("--output-dir",          default="results")
     p.add_argument("--verbose",             action="store_true")
     p.add_argument("--short-drift-weight",  type=float, default=0.4)
@@ -547,6 +723,9 @@ def main():
 
     with open(args.theta) as f:
         theta = CalibratedTheta.from_dict(json.load(f))
+
+    param_model_payload = load_param_model(getattr(args, "param_model", None))
+    label_suffix = "param-model" if param_model_payload is not None else ""
 
     end_dt   = pd.Timestamp(args.end_date) if args.end_date else pd.Timestamp.today()
     start_dt = end_dt - pd.DateOffset(years=3)
@@ -584,7 +763,8 @@ def main():
     end_date_str = end_dt.strftime("%Y-%m-%d")
     print(f"\n[rolling_forward]  {args.symbol}  起點={end_date_str}  "
           f"step={args.step}  total={args.total_bars}  "
-          f"dynamic_drift={args.dynamic_drift}")
+          f"dynamic_drift={args.dynamic_drift}  "
+          f"param_model={'ON' if param_model_payload else 'OFF'}")
 
     result = rolling_forward(
         df=df,
@@ -592,6 +772,7 @@ def main():
         theta=theta,
         args=args,
         actual_future_df=actual_future_df,
+        param_model_payload=param_model_payload,
     )
 
     print_rolling_comparison(
@@ -599,6 +780,7 @@ def main():
         start_price=start_price,
         symbol=args.symbol,
         step=args.step,
+        label_suffix=label_suffix,
     )
 
     render_rolling(
@@ -608,6 +790,7 @@ def main():
         step=args.step,
         end_date_str=end_date_str,
         output_dir=args.output_dir,
+        label_suffix=label_suffix,
     )
 
     # 儲存 JSON
@@ -619,6 +802,7 @@ def main():
         "step":          args.step,
         "total_bars":    args.total_bars,
         "start_price":   round(start_price, 4),
+        "param_model":   str(args.param_model) if args.param_model else None,
         "round_details": result["round_details"],
         "dynamic_drift": args.dynamic_drift,
         "dir_definition": "sign(pred-prev_actual)==sign(actual-prev_actual)",
@@ -630,12 +814,10 @@ def main():
         prev_a = result["actual_prev_closes"]
         na     = min(len(pred), len(actual), len(prev_a))
 
-        # MAE
         mae = float(np.mean(
             np.abs(pred[:na] - actual[:na]) / start_price * 100
         ))
 
-        # 方向命中：統一定義
         p_rets = np.array([
             pred[i] - prev_a[i]
             for i in range(na)
@@ -653,7 +835,8 @@ def main():
         summary["dir_accuracy_pct"] = round(dirs / valid_n * 100, 2) if valid_n > 0 else None
         print(f"\n  整體 MAE={mae:.2f}%   方向命中={dirs}/{valid_n} ({dirs/valid_n*100:.0f}%)")
 
-    json_path = out_path / f"{args.symbol}_{end_date_str}_rolling{args.step}.json"
+    suffix_file = f"_{label_suffix}" if label_suffix else ""
+    json_path = out_path / f"{args.symbol}_{end_date_str}_rolling{args.step}{suffix_file}.json"
     with open(json_path, "w") as fj:
         json.dump(summary, fj, indent=2, ensure_ascii=False)
     print(f"✔ 結果 JSON → {json_path}")
