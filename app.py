@@ -181,6 +181,47 @@ def auto_calibrate_drift(df_window: pd.DataFrame) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 骨幹建構（與 rolling_forward._run_one_step 對齊）
+# ─────────────────────────────────────────────────────────────────────────────
+def build_backbone_fwd(
+    close_hist: np.ndarray,
+    forecast_bars: int,
+    short_drift_weight: float = 0.4,
+) -> tuple[np.ndarray, float]:
+    """
+    對齊 rolling_forward._run_one_step 的骨幹邏輯：
+
+    1. BackboneFitter 擬合歷史，取最後一段 drift（long-term signal）
+    2. 近 5 根 log_ret 均值作為 short_drift（近期動量）
+    3. blend = short_drift_weight * short_drift + (1 - short_drift_weight) * last_drift
+    4. drift decay：每根乘以 decay_factor（向 0 收斂，模擬遠期不確定性增加）
+    5. bb_fwd = cumprod(1 + decayed_blend_drift_per_bar) * last_price
+
+    回傳 (bb_fwd array[forecast_bars], blend_drift scalar)
+    """
+    fitter    = BackboneFitter(n_seg=6, smooth_reg=0.5)
+    window    = close_hist[-500:] if len(close_hist) > 500 else close_hist
+    bb_result = fitter.fit(window)
+    last_drift = float(bb_result.segment_drifts[-1])
+
+    # 近 5 根動量
+    log_rets   = np.diff(np.log(window.astype(float)))
+    short_drift = float(np.mean(log_rets[-5:])) if len(log_rets) >= 5 else last_drift
+
+    blend_drift = short_drift_weight * short_drift + (1.0 - short_drift_weight) * last_drift
+
+    # decay：每根 drift 乘以 decay_factor^t，讓遠期骨幹平坦化
+    decay_factor = 0.98
+    t            = np.arange(1, forecast_bars + 1, dtype=float)
+    decayed      = blend_drift * (decay_factor ** t)
+
+    last_price = float(close_hist[-1])
+    bb_fwd     = last_price * np.cumprod(1.0 + decayed)
+
+    return bb_fwd, blend_drift
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 模擬核心
 # ─────────────────────────────────────────────────────────────────────────────
 def run_simulation(
@@ -215,14 +256,16 @@ def run_simulation(
     market_params_for_params = get_market_params(df_hist)
     calibrated_params = build_params_from_theta(theta, market_params_for_params)
 
-    # ── backbone：交給 simulator 內部的 BackboneFitter（與 rolling_forward 行為一致）
-    #    直接傳 None，simulator 會自行建構
+    # ── 骨幹建構（已對齊 rolling_forward._run_one_step）────────────────────
+    #    blend_drift = short_drift * 0.4 + backbone_last_drift * 0.6
+    #    + decay factor 0.98^t 讓遠期骨幹平坦化
     close_hist = df_hist["Close"].values.astype(float)
-    fitter     = BackboneFitter(n_seg=6, smooth_reg=0.5)
-    bb_result  = fitter.fit(close_hist[-500:] if len(close_hist) > 500 else close_hist)
-    last_drift = float(bb_result.segment_drifts[-1])
-    last_price = float(close_hist[-1])
-    bb_fwd     = last_price * np.exp(last_drift * np.arange(1, forecast_bars + 1, dtype=float))
+    bb_fwd, blend_drift = build_backbone_fwd(close_hist, forecast_bars)
+
+    print(
+        f"[app] bb_fwd  blend_drift={blend_drift:.5f}  "
+        f"start={bb_fwd[0]:.2f}  end={bb_fwd[-1]:.2f}"
+    )
 
     # ── agent_profile 套用 ───────────────────────────────────────────────────
     base_momentum_boost = 1.0
@@ -281,7 +324,8 @@ def run_simulation(
             "mr_coeff":          round(mr_coeff,                5),
             "momentum_strength": round(theta.momentum_strength, 4),
         },
-        "bb_fwd": bb_fwd,
+        "bb_fwd":       bb_fwd,
+        "blend_drift":  round(blend_drift, 6),
         "agent_active": agent_profile is not None,
     }
     return ohlcv, meta, used_cache
@@ -384,6 +428,7 @@ def api_simulate():
             "n_sim_paths":    n_sim_paths,
             "auto_params":    ap,
             "theta":          th,
+            "blend_drift":    meta["blend_drift"],
             "cache_tag":      cache_tag,
             "agent_tag":      agent_tag,
         })
@@ -625,6 +670,7 @@ async function runSim() {
       cacheTag,
       agentTag,
       `<span>Medoid / <b>${data.n_sim_paths}</b> 條</span>`,
+      `<span>blend_drift <b>${data.blend_drift}</b></span>`,
       `<span>drift_scale <b>${ap.drift_scale}</b></span>`,
       `<span>drift_decay <b>${ap.drift_decay}</b></span>`,
       `<span>vol_mult <b>${ap.vol_multiplier}</b></span>`,
