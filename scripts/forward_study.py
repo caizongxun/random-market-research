@@ -1,5 +1,11 @@
 """
-forward_study.py  v11.2  (GJR-GARCH + auto-calibrate + OHLC K線預測)
+forward_study.py  v11.3  (GJR-GARCH + auto-calibrate + OHLC K線預測)
+
+v11.3 新增：
+  1. momentum 翻轉偵測 — 最近 3 根 K 棒連漲且 blend_drift < 0 時，
+     momentum_bias 強制歸零，不讓空頭動能繼續拖住走勢
+  2. 前期快速衰減 — drift 在前 10 根後以 2× 速率衰減，
+     之後恢復正常，讓後半段純靠波動率驅動
 
 v11.2 新增：
   1. blend_drift 動態截斷 — MAX = 0.5 × σ_garch（無 GARCH 時 fallback 到 0.5 × rv）
@@ -157,6 +163,10 @@ def parse_args():
                    help="近期 5 日 drift 在 backbone 混合中的權重 (0~1)")
     p.add_argument("--drift-clamp",    type=float, default=None,
                    help="手動指定 blend_drift 截斷上限 (絕對值, 每日)。不指定則動態用 0.5×σ_garch")
+    p.add_argument("--reversal-window", type=int,  default=3,
+                   help="連漲/連跌幾根觸發 momentum 翻轉歸零 (預設 3)")
+    p.add_argument("--early-decay-bars", type=int, default=10,
+                   help="前 N 根使用 2× drift_decay，之後恢復正常 (預設 10)")
     return p.parse_args()
 
 
@@ -219,9 +229,10 @@ def auto_calibrate(
 def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dict | None,
                       momentum_bias: float = 0.0, breakout_state: int = 0,
                       blend_drift: float = 0.0, short_drift: float = 0.0,
-                      last_drift: float = 0.0, drift_clamp_max: float | None = None):
+                      last_drift: float = 0.0, drift_clamp_max: float | None = None,
+                      momentum_reversed: bool = False):
     print("\n" + "─" * 60)
-    print("  VERBOSE DIAGNOSTICS (v11.2)")
+    print("  VERBOSE DIAGNOSTICS (v11.3)")
     print("─" * 60)
     if calib_info:
         gi  = calib_info.get("_garch_info", {})
@@ -238,6 +249,8 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
     print(f"\n  [動能狀態]")
     print(f"  momentum_bias   : {momentum_bias:+.4f}  (estimator 原值，不歸零)")
     print(f"  breakout_state  : {breakout_state}")
+    if momentum_reversed:
+        print(f"  ⚡ momentum 翻轉偵測：連漲 {args.reversal_window} 根 + blend_drift<0 → momentum_bias 歸零")
     print(f"\n  [backbone drift 混合]")
     print(f"  short_drift(5d) : {short_drift*100:+.4f}%/day")
     print(f"  last_drift(bb)  : {last_drift*100:+.4f}%/day")
@@ -249,6 +262,8 @@ def print_diagnostics(args, calib_info: dict | None, model_predicted_params: dic
           + clamp_str)
     if drift_clamp_max:
         print(f"  drift_clamp_max : ±{drift_clamp_max*100:.4f}%/day  (0.5×σ_garch)")
+    print(f"\n  [前期快速衰減]")
+    print(f"  early_decay_bars: {args.early_decay_bars} 根  (2×drift_decay → 正常)")
     print(f"\n  [最終模擬參數]")
     print(f"  intra_bar       : {args.intra_bar}")
     print(f"  momentum_boost  : {args.momentum_boost}")
@@ -623,7 +638,7 @@ def main():
     if args.auto_calibrate:
         calib_window = args.calib_window
         model_label  = args.garch_model if use_garch else "rv"
-        print(f"\n[auto-calibrate v11.2] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
+        print(f"\n[auto-calibrate v11.3] 掃描前 {calib_window} 根 K 棒  (vol_model={model_label})...")
         calib = auto_calibrate(
             df.iloc[:train_end_idx]["Close"].values.astype(float),
             theta,
@@ -713,6 +728,30 @@ def main():
     momentum_bias   = float(getattr(params_fwd, "momentum_bias",       0.0))
     breakout_state  = int(getattr(params_fwd,   "node_breakout_state", 0))
 
+    # ── v11.3：momentum 翻轉偵測 ──
+    # 最近 reversal_window 根連漲 且 blend_drift < 0 → momentum_bias 歸零
+    momentum_reversed = False
+    reversal_win = max(1, args.reversal_window)
+    if blend_drift < 0 and len(log_ret_hist) >= reversal_win:
+        recent_rets = log_ret_hist[-reversal_win:]
+        if all(r > 0 for r in recent_rets):
+            momentum_bias = 0.0
+            momentum_reversed = True
+
+    # ── v11.3：前期快速衰減 drift schedule ──
+    # 前 early_decay_bars 根使用 2× drift_decay，之後恢復原速
+    early_bars  = max(0, args.early_decay_bars)
+    base_decay  = float(args.drift_decay or 0.04)
+    fast_decay  = min(base_decay * 2.0, 0.99)
+
+    # 重建 drift schedule（逐根衰減）
+    drift_schedule = np.empty(args.forecast)
+    current_drift  = blend_drift
+    for t in range(args.forecast):
+        drift_schedule[t] = current_drift
+        decay = fast_decay if t < early_bars else base_decay
+        current_drift *= (1.0 - decay)
+
     if args.verbose:
         print_diagnostics(
             args, calib_info, model_predicted_params,
@@ -722,6 +761,7 @@ def main():
             short_drift=short_drift,
             last_drift=last_drift,
             drift_clamp_max=drift_clamp_max,
+            momentum_reversed=momentum_reversed,
         )
 
     # ── simulate ──
@@ -729,8 +769,9 @@ def main():
     print(f"\n[simulate] {args.symbol}  起點={end_date_str}  forecast={args.forecast}  n_paths={args.n_paths}")
     print(f"  blend_drift={blend_drift*100:+.4f}%/day  "
           f"(short={short_drift*100:+.4f}%  long={last_drift*100:+.4f}%  w={w})")
-    print(f"  momentum_bias={momentum_bias:+.4f}  breakout_state={breakout_state}")
-    print(f"  drift_scale={args.drift_scale}  drift_decay={args.drift_decay}  "
+    print(f"  momentum_bias={momentum_bias:+.4f}  breakout_state={breakout_state}"
+          + ("  [翻轉歸零]" if momentum_reversed else ""))
+    print(f"  drift_scale={args.drift_scale}  drift_decay={base_decay}(fast={fast_decay:.4f} ×{early_bars}bars)  "
           f"vol_multiplier={args.vol_multiplier}  momentum_boost={args.momentum_boost}")
 
     sim = USStockFutureSimulator(
@@ -744,12 +785,12 @@ def main():
         momentum_strength=theta.momentum_strength * (args.momentum_boost or 1.0),
         momentum_decay=theta.momentum_decay,
         breakout_boost=theta.breakout_boost,
-        drift_schedule=drift_fwd,
+        drift_schedule=drift_schedule,
         vol_schedule=vol_fwd,
         backbone_schedule=bb_fwd,
         backbone_mr_coeff=0.06,
         intra_bar_steps=args.intra_bar or 2,
-        drift_decay_rate=args.drift_decay or 0.04,
+        drift_decay_rate=base_decay,
         drift_scale=args.drift_scale or 1.0,
         momentum_anchor_weight=0.45,
     )
@@ -802,18 +843,21 @@ def main():
         "params": {
             "intra_bar":          args.intra_bar,
             "momentum_boost":     args.momentum_boost,
-            "drift_decay":        args.drift_decay,
+            "drift_decay":        base_decay,
+            "drift_decay_fast":   fast_decay,
+            "early_decay_bars":   early_bars,
             "vol_multiplier":     args.vol_multiplier,
             "drift_scale":        args.drift_scale,
             "blend_drift":        round(blend_drift, 6),
             "short_drift_weight": w,
             "drift_clamp_max":    round(drift_clamp_max, 6) if drift_clamp_max else None,
         },
-        "momentum_bias":    momentum_bias,
-        "breakout_state":   breakout_state,
-        "auto_calibrate":   args.auto_calibrate,
-        "model_predicted":  model_predicted_params,
-        "rep_path":         [round(float(x), 4) for x in rep_close],
+        "momentum_bias":      momentum_bias,
+        "momentum_reversed":  momentum_reversed,
+        "breakout_state":     breakout_state,
+        "auto_calibrate":     args.auto_calibrate,
+        "model_predicted":    model_predicted_params,
+        "rep_path":           [round(float(x), 4) for x in rep_close],
     }
 
     json_path = out_path / f"{args.symbol}_{end_date_str}_{mode_tag}.json"
