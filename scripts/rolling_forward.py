@@ -1,49 +1,35 @@
 """
-rolling_forward.py
+rolling_forward.py  (v2 - Medoid + P10/P90 + Coverage + Agent Layer)
 
-核心邏輪
+核心流程
 --------
-每「輪」只預測 N 根（預設 5），然後把「真實」的 N 根 K 棒
-接在歷史尾端，再重新校準 + 預測下一輪。
+每「輪」只預測 N 根（預設 5），然後把真實 N 根接在歷史尾端，
+再重新校準 + 預測下一輪。
 
-流程示意（N=5，共跑 6 輪 = 30 根）：
+新增功能（v2）
+--------------
+1. Medoid 路徑選取：模擬 n_paths 條路徑，選出和其他所有路徑
+   Euclidean 距離總和最小的那條（保留波動、轉折，不平滑化）。
+2. P10/P90 信心區間：每根 K 棒的第 10、90 百分位數。
+3. 覆蓋率評估：實際走勢落在 P10–P90 的比例，目標 ≈ 80%。
+4. 代理人行為層：載入 agent_profile.json，調整 momentum_boost
+   和 mr_coeff，讓模擬反映散戶/大戶行為特徵。
 
-  輪次  訓練窗口末端          預測範圍
-  ──────────────────────────────────────────
-  0     t=0                  t=1~5   (預測5根)
-  1     t=5  (真實K棒填入)   t=6~10
-  2     t=10                 t=11~15
-  ...
-
-方向命中定義（v2 修後）
+方向命中定義（v2）
 ------------------
-「預測收盤相對前一根」 vs 「實際收盤相對前一根」
-  - P-Ret: (pred_t - actual_{t-1}) / actual_{t-1}
-  - A-Ret: (actual_t - actual_{t-1}) / actual_{t-1}
-  - Dir 命中: sign(P-Ret) == sign(A-Ret)
-兩者基準一致，即可相互比較。
+  P-Ret_t = pred_close_t  - actual_close_{t-1}
+  A-Ret_t = actual_close_t - actual_close_{t-1}
+  命中 = sign(P-Ret) == sign(A-Ret)
 
 用法
 ----
   python scripts/rolling_forward.py \\
     --symbol AAPL \\
-    --theta results/theta_aapl.json \\
+    --theta cache/AAPL_theta.json \\
+    --agent-profile cache/AAPL_agent_profile.json \\
     --end-date 2025-01-01 \\
-    --total-bars 30 \\
-    --step 5 \\
-    --auto-calibrate \\
-    --verbose
-
-  # 加入參數模型覆蓋 drift_scale / drift_decay：
-  python scripts/rolling_forward.py \\
-    --symbol AAPL \\
-    --theta results/theta_aapl.json \\
-    --end-date 2025-01-01 \\
-    --total-bars 30 \\
-    --step 5 \\
-    --auto-calibrate \\
-    --param-model models/param_model_AAPL.joblib \\
-    --verbose
+    --total-bars 20 \\
+    --step 5
 """
 
 from __future__ import annotations
@@ -89,10 +75,134 @@ except ImportError:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 參數模型載入（optional）
+# 代理人行為層
+# ──────────────────────────────────────────────────────────────────────────────
+def load_agent_profile(path: str | None) -> dict | None:
+    """載入 agent_profile.json，回傳 dict 或 None。"""
+    if path is None:
+        return None
+    p = Path(path)
+    if not p.exists():
+        print(f"[agent-profile] 找不到 {path}，跳過代理人行為調整")
+        return None
+    with open(p) as f:
+        profile = json.load(f)
+    print(f"[agent-profile] 載入 {path}")
+    print(f"  散戶動能={profile.get('retail_momentum_strength', 'N/A'):.3f}  "
+          f"恐慌靈敏={profile.get('retail_panic_sensitivity', 'N/A'):.3f}  "
+          f"大戶MR={profile.get('inst_mr_strength', 'N/A'):.3f}")
+    return profile
+
+
+def apply_agent_profile(
+    profile: dict | None,
+    base_momentum_boost: float,
+    base_mr_coeff: float,
+    vix_now: float | None = None,
+) -> tuple[float, float]:
+    """
+    根據 agent_profile 調整 momentum_boost 和 mr_coeff。
+
+    散戶動能強 → momentum_boost 上調
+    大戶均值回歸強 → mr_coeff 上調
+    恐慌靈敏度高 + VIX 高 → momentum_boost 下調（拋售壓制動能）
+    """
+    if profile is None:
+        return base_momentum_boost, base_mr_coeff
+
+    retail_mom  = float(profile.get("retail_momentum_strength",  0.5))
+    panic_sens  = float(profile.get("retail_panic_sensitivity",  0.3))
+    inst_mr     = float(profile.get("inst_mr_strength",          0.5))
+    vix_cal     = float(profile.get("vix_level") or 20.0)
+    vix_ref     = vix_now if vix_now else vix_cal
+
+    # 散戶動能：0.5 為中性，>0.5 上調 momentum_boost
+    mom_adj = (retail_mom - 0.5) * 0.6   # 最多 ±0.3
+
+    # 恐慌修正：VIX 高時壓制動能
+    panic_adj = -panic_sens * float(np.clip((vix_ref - 20) / 30, 0.0, 1.0)) * 0.3
+
+    new_momentum_boost = float(np.clip(base_momentum_boost + mom_adj + panic_adj, 0.3, 2.5))
+
+    # 大戶 MR：inst_mr_strength > 0.5 增強回歸力
+    mr_adj = (inst_mr - 0.5) * 0.04   # 最多 ±0.02
+    new_mr_coeff = float(np.clip(base_mr_coeff + mr_adj, 0.01, 0.20))
+
+    return new_momentum_boost, new_mr_coeff
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Medoid 路徑選取
+# ──────────────────────────────────────────────────────────────────────────────
+def select_medoid_path(all_paths: np.ndarray) -> tuple[int, np.ndarray]:
+    """
+    從 all_paths (shape: n_paths x n_steps) 選出 medoid。
+    Medoid = 和其他所有路徑 Euclidean 距離總和最小的那條。
+
+    Returns:
+        medoid_idx : int
+        medoid_path: np.ndarray (n_steps,)
+    """
+    n = all_paths.shape[0]
+    if n == 1:
+        return 0, all_paths[0]
+
+    # 樣本數大時用隨機子集加速（最多 200 條計算距離矩陣）
+    if n > 200:
+        idx_sample = np.random.choice(n, 200, replace=False)
+        subset = all_paths[idx_sample]
+        # pairwise distances in subset
+        diff = subset[:, np.newaxis, :] - subset[np.newaxis, :, :]
+        dist_matrix = np.sqrt(np.sum(diff ** 2, axis=-1))
+        dist_sums = dist_matrix.sum(axis=1)
+        medoid_local = int(np.argmin(dist_sums))
+        medoid_idx = int(idx_sample[medoid_local])
+    else:
+        diff = all_paths[:, np.newaxis, :] - all_paths[np.newaxis, :, :]
+        dist_matrix = np.sqrt(np.sum(diff ** 2, axis=-1))
+        dist_sums = dist_matrix.sum(axis=1)
+        medoid_idx = int(np.argmin(dist_sums))
+
+    return medoid_idx, all_paths[medoid_idx]
+
+
+def compute_pi_bands(
+    all_paths: np.ndarray,
+    p_low: float = 10.0,
+    p_high: float = 90.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    計算每個時間步的 P10 / P90 百分位數。
+
+    Args:
+        all_paths: shape (n_paths, n_steps)
+    Returns:
+        p_low_arr, p_high_arr: 各 shape (n_steps,)
+    """
+    lo = np.percentile(all_paths, p_low,  axis=0)
+    hi = np.percentile(all_paths, p_high, axis=0)
+    return lo, hi
+
+
+def compute_coverage(
+    actual: np.ndarray,
+    p_lo:   np.ndarray,
+    p_hi:   np.ndarray,
+) -> float:
+    """
+    計算覆蓋率：實際收盤落在 [p_lo, p_hi] 的比例。
+    """
+    n = min(len(actual), len(p_lo), len(p_hi))
+    if n == 0:
+        return float("nan")
+    inside = np.sum((actual[:n] >= p_lo[:n]) & (actual[:n] <= p_hi[:n]))
+    return float(inside / n)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 參數模型
 # ──────────────────────────────────────────────────────────────────────────────
 def load_param_model(path: str | None):
-    """載入 joblib 封裝的參數模型。若 path 為 None 回傳 None。"""
     if path is None:
         return None
     try:
@@ -105,7 +215,6 @@ def load_param_model(path: str | None):
     return payload
 
 
-# 複製自 collect_training_data.py 的特徵提取
 def _garch_features(close_arr):
     try:
         from arch import arch_model
@@ -132,7 +241,6 @@ def _garch_features(close_arr):
 
 
 def _extract_features(df_window: pd.DataFrame, theta_vol: float) -> dict:
-    """與 collect_training_data.py 完全一致的特徵提取。"""
     c = df_window["Close"].values.astype(float)
     o = df_window["Open"].values.astype(float)
     h = df_window["High"].values.astype(float)
@@ -210,10 +318,6 @@ def apply_param_model(
     calib: dict,
     verbose: bool = False,
 ) -> dict:
-    """
-    用模型預測 drift_scale / drift_decay，覆蓋 auto_calibrate 輸出。
-    momentum_boost 保留 auto_calibrate 的值（模型 CV MAE≈0，無信號）。
-    """
     if payload is None:
         return calib
 
@@ -221,13 +325,11 @@ def apply_param_model(
     feature_cols = payload["feature_cols"]
     models       = payload["models"]
 
-    # 對齊特徵順序，缺少的填 0
     x = np.array([[feats.get(fc.replace("feat_", ""), 0.0) for fc in feature_cols]])
 
     pred_ds = float(models["target_drift_scale"].predict(x)[0])
     pred_dd = float(models["target_drift_decay"].predict(x)[0])
 
-    # 合理邊界防爆
     pred_ds = float(np.clip(pred_ds, 0.2, 4.0))
     pred_dd = float(np.clip(pred_dd, 0.01, 0.30))
 
@@ -242,7 +344,7 @@ def apply_param_model(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 單輪預測
+# 單輪預測（回傳所有路徑 + medoid + bands）
 # ──────────────────────────────────────────────────────────────────────────────
 def _run_one_step(
     close_hist: np.ndarray,
@@ -250,7 +352,16 @@ def _run_one_step(
     args,
     full_df_up_to_now: pd.DataFrame,
     param_model_payload=None,
-) -> tuple[np.ndarray, dict | None]:
+    agent_profile: dict | None = None,
+) -> tuple[np.ndarray, dict | None, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns:
+        rep_close   : medoid 路徑收盤 (step,)
+        ohlc        : medoid OHLC dict or None
+        all_closes  : 所有路徑收盤 (n_paths, step)
+        p10         : P10 per bar   (step,)
+        p90         : P90 per bar   (step,)
+    """
     step = args.step
 
     calib = auto_calibrate(
@@ -261,7 +372,6 @@ def _run_one_step(
         garch_model=args.garch_model,
     )
 
-    # ── 參數模型覆蓋 ──────────────────────────────────────────
     if param_model_payload is not None:
         calib_window_df = full_df_up_to_now.iloc[-args.calib_window:]
         calib = apply_param_model(
@@ -271,7 +381,6 @@ def _run_one_step(
             calib,
             verbose=getattr(args, "verbose", False),
         )
-    # ─────────────────────────────────────────────────────────
 
     intra_bar       = calib["intra_bar"]
     momentum_boost  = calib["momentum_boost"]
@@ -279,6 +388,16 @@ def _run_one_step(
     vol_multiplier  = calib["vol_multiplier"]
     drift_scale     = calib["drift_scale"]
     drift_clamp_max = calib["drift_clamp_max"]
+
+    # ── 代理人行為調整 ──────────────────────────────────────
+    base_mr = theta.mr_coeff
+    momentum_boost, base_mr = apply_agent_profile(
+        agent_profile,
+        momentum_boost,
+        base_mr,
+        vix_now=None,
+    )
+    # ────────────────────────────────────────────────────────
 
     fitter     = BackboneFitter(n_seg=6, smooth_reg=0.5)
     bb_result  = fitter.fit(close_hist)
@@ -359,7 +478,7 @@ def _run_one_step(
         n_paths=args.n_paths,
         seed=42,
         vol_scale=vol_scale,
-        mr_coeff=theta.mr_coeff,
+        mr_coeff=base_mr,
         node_coeff=theta.node_coeff,
         momentum_strength=theta.momentum_strength * momentum_boost,
         momentum_decay=theta.momentum_decay,
@@ -375,12 +494,48 @@ def _run_one_step(
     )
     result = sim.simulate()
 
-    rep_close, ohlc = pick_representative_path(result)
-    if len(rep_close) == 0:
-        rep_close = np.full(step, start_price)
-        ohlc = None
+    # ── 收集所有路徑的收盤價 ────────────────────────────────
+    # result.paths shape: (n_paths, n_steps, 4) 或類似
+    # 嘗試多種可能的屬性名稱
+    all_closes = None
+    for attr in ["paths", "close_paths", "all_paths"]:
+        if hasattr(result, attr):
+            arr = getattr(result, attr)
+            if isinstance(arr, np.ndarray) and arr.ndim >= 2:
+                # 取最後一個維度若 ndim==3，否則直接用
+                all_closes = arr[:, :step, -1] if arr.ndim == 3 else arr[:, :step]
+                break
 
-    return rep_close[:step], (ohlc if ohlc is None else {k: v[:step] for k, v in ohlc.items()})
+    if all_closes is None or len(all_closes) == 0:
+        # fallback：用 pick_representative_path 取單條
+        rep_close, ohlc = pick_representative_path(result)
+        if len(rep_close) == 0:
+            rep_close = np.full(step, start_price)
+            ohlc = None
+        rep_close = rep_close[:step]
+        p10 = rep_close.copy()
+        p90 = rep_close.copy()
+        if ohlc is not None:
+            ohlc = {k: v[:step] for k, v in ohlc.items()}
+        return rep_close, ohlc, rep_close[np.newaxis, :], p10, p90
+
+    # ── Medoid 選取 ─────────────────────────────────────────
+    medoid_idx, medoid_close = select_medoid_path(all_closes)
+    p10, p90 = compute_pi_bands(all_closes)
+
+    medoid_close = medoid_close[:step]
+    p10 = p10[:step]
+    p90 = p90[:step]
+
+    # 從模擬結果中取 medoid 路徑的 OHLC
+    ohlc = None
+    rep_close, rep_ohlc = pick_representative_path(result)
+    if rep_ohlc is not None:
+        ohlc = {k: v[:step] for k, v in rep_ohlc.items()}
+        # 用 medoid close 覆蓋
+        ohlc["close"] = medoid_close
+
+    return medoid_close, ohlc, all_closes, p10, p90
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -393,6 +548,7 @@ def rolling_forward(
     args,
     actual_future_df: pd.DataFrame | None = None,
     param_model_payload=None,
+    agent_profile: dict | None = None,
 ) -> dict:
     step       = args.step
     total_bars = args.total_bars
@@ -400,6 +556,8 @@ def rolling_forward(
 
     pred_closes  : list[float] = []
     pred_ohlcs   : list[dict]  = []
+    pred_p10     : list[float] = []
+    pred_p90     : list[float] = []
     round_details: list[dict]  = []
 
     cur_end   = train_end_idx
@@ -423,15 +581,19 @@ def rolling_forward(
         start_price = float(close_hist[-1])
         print(f"  [輪 {rnd+1}/{rounds}]  訓練截至 idx={cur_end-1}  起點={start_price:.2f}  預測 {need} 根")
 
-        rep, ohlc = _run_one_step(
+        med, ohlc, all_c, p10, p90 = _run_one_step(
             close_hist, theta, args, full_window,
             param_model_payload=param_model_payload,
+            agent_profile=agent_profile,
         )
-        rep = rep[:need]
+        med  = med[:need]
+        p10  = p10[:need]
+        p90  = p90[:need]
         if ohlc is not None:
             ohlc = {k: v[:need] for k, v in ohlc.items()}
 
         actual_slice: np.ndarray | None = None
+        coverage_val: float | None = None
         if actual_future_df is not None:
             sl = actual_future_df.iloc[bars_done: bars_done + need]
             if len(sl) > 0:
@@ -440,27 +602,32 @@ def rolling_forward(
         if actual_slice is not None and len(actual_slice) == need:
             prev_actual_for_dir = np.concatenate([[start_price], actual_slice[:-1]])
             mae_pct  = float(np.mean(
-                np.abs(rep - actual_slice) / start_price * 100
+                np.abs(med - actual_slice) / start_price * 100
             ))
-            p_rets   = rep - prev_actual_for_dir
+            p_rets   = med - prev_actual_for_dir
             a_rets   = actual_slice - prev_actual_for_dir
             dir_hits = int(np.sum(np.sign(p_rets) == np.sign(a_rets)))
+            coverage_val = float(compute_coverage(actual_slice, p10, p90))
         else:
             mae_pct  = None
             dir_hits = None
 
         round_details.append({
-            "round":       rnd + 1,
-            "start_price": round(start_price, 4),
-            "pred_end":    round(float(rep[-1]), 4),
-            "actual_end":  round(float(actual_slice[-1]), 4) if actual_slice is not None and len(actual_slice) > 0 else None,
-            "mae_pct":     round(mae_pct, 4) if mae_pct is not None else None,
-            "dir_hits":    dir_hits,
-            "bars":        need,
+            "round":        rnd + 1,
+            "start_price":  round(start_price, 4),
+            "pred_end":     round(float(med[-1]), 4),
+            "actual_end":   round(float(actual_slice[-1]), 4) if actual_slice is not None and len(actual_slice) > 0 else None,
+            "mae_pct":      round(mae_pct, 4) if mae_pct is not None else None,
+            "dir_hits":     dir_hits,
+            "coverage":     round(coverage_val, 4) if coverage_val is not None else None,
+            "bars":         need,
         })
 
-        pred_closes.extend(rep.tolist())
+        pred_closes.extend(med.tolist())
         pred_ohlcs.append(ohlc)
+        pred_p10.extend(p10.tolist())
+        pred_p90.extend(p90.tolist())
+
         if actual_slice is not None and len(actual_slice) == need:
             actual_prev_closes.extend(
                 np.concatenate([[start_price], actual_slice[:-1]]).tolist()
@@ -472,6 +639,8 @@ def rolling_forward(
         bars_done += need
 
     pred_arr  = np.array(pred_closes)
+    p10_arr   = np.array(pred_p10)
+    p90_arr   = np.array(pred_p90)
     actual_arr: np.ndarray | None = None
     if actual_future_df is not None and len(actual_future_df) >= total_bars:
         actual_arr = actual_future_df.iloc[:total_bars]["Close"].values.astype(float)
@@ -484,11 +653,13 @@ def rolling_forward(
         "actual_closes":      actual_arr,
         "actual_prev_closes": actual_prev_closes,
         "round_details":      round_details,
+        "p10":                p10_arr,
+        "p90":                p90_arr,
     }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 圖表
+# 圖表（加入 P10/P90 區間）
 # ──────────────────────────────────────────────────────────────────────────────
 def render_rolling(
     symbol: str,
@@ -502,12 +673,22 @@ def render_rolling(
     pred   = result["pred_closes"]
     actual = result["actual_closes"]
     ohlcs  = result["pred_ohlcs"]
+    p10    = result.get("p10", None)
+    p90    = result.get("p90", None)
     total  = len(pred)
 
     fig, ax = plt.subplots(figsize=(16, 6))
 
     hist_x = np.arange(-len(hist_close), 0)
     ax.plot(hist_x, hist_close, color="#555", lw=1.2, label="歷史", zorder=4)
+
+    # P10/P90 信心區間
+    if p10 is not None and p90 is not None and len(p10) == total:
+        x_band = np.arange(total)
+        ax.fill_between(
+            x_band, p10, p90,
+            alpha=0.15, color="#42A5F5", label="P10–P90 信心區間", zorder=2
+        )
 
     palette = ["#26A69A", "#42A5F5", "#AB47BC", "#FF7043", "#66BB6A", "#FFA726"]
     for rnd_i, ohlc in enumerate(ohlcs):
@@ -549,35 +730,53 @@ def render_rolling(
 
     ax.axvline(0, color="#999", lw=0.8, ls=":")
     suffix_display = f" [{label_suffix}]" if label_suffix else ""
-    ax.set_title(f"{symbol}  Rolling {step}-bar Forward  [{end_date_str}]{suffix_display}")
+    ax.set_title(f"{symbol}  Rolling {step}-bar Forward (Medoid+P10/P90)  [{end_date_str}]{suffix_display}")
     ax.set_xlabel("交易日（相對預測起點）")
     ax.set_ylabel("價格")
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3)
 
     round_details   = result["round_details"]
-    maes            = [r["mae_pct"] for r in round_details if r["mae_pct"] is not None]
-    rounds_with_mae = [r["round"]   for r in round_details if r["mae_pct"] is not None]
+    maes            = [r["mae_pct"]  for r in round_details if r["mae_pct"]  is not None]
+    coverages       = [r["coverage"] for r in round_details if r["coverage"] is not None]
+    rounds_with_mae = [r["round"]    for r in round_details if r["mae_pct"]  is not None]
 
     if maes:
-        fig2, ax2 = plt.subplots(figsize=(10, 3))
-        avg       = np.mean(maes)
-        colors2   = ["#EF5350" if m > avg else "#26A69A" for m in maes]
-        ax2.bar(rounds_with_mae, maes, color=colors2, alpha=0.8, width=0.6)
-        ax2.axhline(avg, color="#888", lw=1, ls="--",
-                    label=f"平均 MAE={avg:.2f}%")
-        ax2.set_title(f"{symbol}  每輪 MAE (close){suffix_display}")
-        ax2.set_xlabel("輪次")
-        ax2.set_ylabel("MAE %")
-        ax2.legend(fontsize=8)
-        ax2.grid(True, alpha=0.3)
+        fig2, axes2 = plt.subplots(1, 2, figsize=(14, 3))
+        avg = np.mean(maes)
+        colors2 = ["#EF5350" if m > avg else "#26A69A" for m in maes]
+        axes2[0].bar(rounds_with_mae, maes, color=colors2, alpha=0.8, width=0.6)
+        axes2[0].axhline(avg, color="#888", lw=1, ls="--", label=f"平均 MAE={avg:.2f}%")
+        axes2[0].set_title(f"{symbol}  每輪 MAE (Medoid){suffix_display}")
+        axes2[0].set_xlabel("輪次")
+        axes2[0].set_ylabel("MAE %")
+        axes2[0].legend(fontsize=8)
+        axes2[0].grid(True, alpha=0.3)
+
+        if coverages:
+            cov_rounds = [r["round"] for r in round_details if r["coverage"] is not None]
+            avg_cov = np.mean(coverages)
+            cov_colors = ["#66BB6A" if c >= 0.7 else "#FF7043" for c in coverages]
+            axes2[1].bar(cov_rounds, [c * 100 for c in coverages],
+                         color=cov_colors, alpha=0.8, width=0.6)
+            axes2[1].axhline(80, color="#888", lw=1, ls="--", label="目標 80%")
+            axes2[1].axhline(avg_cov * 100, color="#42A5F5", lw=1, ls=":",
+                             label=f"平均={avg_cov*100:.1f}%")
+            axes2[1].set_title(f"{symbol}  每輪覆蓋率 P10–P90{suffix_display}")
+            axes2[1].set_xlabel("輪次")
+            axes2[1].set_ylabel("覆蓋率 %")
+            axes2[1].set_ylim(0, 110)
+            axes2[1].legend(fontsize=8)
+            axes2[1].grid(True, alpha=0.3)
+
         out2 = Path(output_dir)
         out2.mkdir(parents=True, exist_ok=True)
         suffix_file = f"_{label_suffix}" if label_suffix else ""
-        mae_path = out2 / f"{symbol}_{end_date_str}_rolling{step}{suffix_file}_mae.png"
+        mae_path = out2 / f"{symbol}_{end_date_str}_rolling{step}{suffix_file}_metrics.png"
+        fig2.tight_layout()
         fig2.savefig(mae_path, dpi=150, bbox_inches="tight")
         plt.close(fig2)
-        print(f"✔ MAE 圖 → {mae_path}")
+        print(f"✔ 指標圖 → {mae_path}")
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -610,30 +809,34 @@ def print_rolling_comparison(
     pred            = result["pred_closes"]
     actual          = result["actual_closes"]
     actual_prev_arr = result.get("actual_prev_closes", [])
+    p10_arr         = result.get("p10", np.array([]))
+    p90_arr         = result.get("p90", np.array([]))
     n               = len(pred)
 
     suffix_display = f" [{label_suffix}]" if label_suffix else ""
-    sep = "─" * 84
+    sep = "─" * 96
     print(f"\n{sep}")
-    print(f"  Rolling {step}-bar Forward  —  {symbol}  (共 {n} 根 K 棒){suffix_display}")
-    print(f"  Dir 定義: sign(pred - prev_actual) == sign(actual - prev_actual)")
+    print(f"  Rolling {step}-bar Forward (Medoid+P10/P90)  —  {symbol}  (共 {n} 根){suffix_display}")
     print(sep)
     hdr = (f"  {'Rnd':>3} {'Bar':>3}  "
-           f"{'P-Close':>8} {'P-Ret%':>7}  "
+           f"{'P-Close':>8} {'P10':>8} {'P90':>8}  "
            f"{'A-Close':>8} {'A-Ret%':>7}  "
-           f"{'Err%':>7} {'Dir':>3}")
+           f"{'Err%':>7} {'Dir':>3} {'Cover':>5}")
     print(hdr)
-    print("─" * 84)
+    print("─" * 96)
 
     global_i    = 0
     close_errs  = []
     dir_correct = 0
+    cover_hits  = 0
     total_bars_with_actual = 0
 
     for rnd_i, rnd in enumerate(result["round_details"]):
         bars_this = rnd["bars"]
         for b in range(bars_this):
             p_c      = float(pred[global_i])
+            p10_v    = float(p10_arr[global_i]) if global_i < len(p10_arr) else p_c
+            p90_v    = float(p90_arr[global_i]) if global_i < len(p90_arr) else p_c
             prev_act = float(actual_prev_arr[global_i]) if global_i < len(actual_prev_arr) and actual_prev_arr[global_i] is not None else None
 
             p_ret = (p_c - prev_act) / prev_act * 100 if prev_act else float("nan")
@@ -645,35 +848,42 @@ def print_rolling_comparison(
                 close_errs.append(abs(err))
                 total_bars_with_actual += 1
 
-                p_up  = p_ret >= 0
-                a_up  = a_ret >= 0
-                match = "✓" if p_up == a_up else "✗"
+                p_up   = p_ret >= 0
+                a_up   = a_ret >= 0
+                match  = "✓" if p_up == a_up else "✗"
+                in_pi  = "Y" if p10_v <= a_c <= p90_v else "N"
                 if p_up == a_up:
                     dir_correct += 1
+                if in_pi == "Y":
+                    cover_hits += 1
 
                 print(f"  {rnd_i+1:>3} {b+1:>3}  "
-                      f"{p_c:>8.2f} {p_ret:>+7.2f}%  "
+                      f"{p_c:>8.2f} {p10_v:>8.2f} {p90_v:>8.2f}  "
                       f"{a_c:>8.2f} {a_ret:>+7.2f}%  "
-                      f"{err:>+7.2f}% {match:>3}")
+                      f"{err:>+7.2f}% {match:>3} {in_pi:>5}")
             else:
                 print(f"  {rnd_i+1:>3} {b+1:>3}  "
-                      f"{p_c:>8.2f} {p_ret:>+7.2f}%  "
+                      f"{p_c:>8.2f} {p10_v:>8.2f} {p90_v:>8.2f}  "
                       f"{'N/A':>8} {'N/A':>7}  "
-                      f"{'N/A':>7} {'N/A':>3}")
+                      f"{'N/A':>7} {'N/A':>3} {'N/A':>5}")
             global_i += 1
 
         rnd_mae = rnd.get("mae_pct")
         rnd_dir = rnd.get("dir_hits")
+        rnd_cov = rnd.get("coverage")
         if rnd_mae is not None:
-            print(f"  {'':>7}  → 本輪 MAE={rnd_mae:.2f}%  方向命中={rnd_dir}/{bars_this}")
-        print("  " + "·" * 42)
+            cov_str = f"  覆蓋率={rnd_cov*100:.1f}%" if rnd_cov is not None else ""
+            print(f"  {'':>7}  → 本輪 MAE={rnd_mae:.2f}%  方向命中={rnd_dir}/{bars_this}{cov_str}")
+        print("  " + "·" * 48)
 
     print(sep)
     if close_errs:
         tn = total_bars_with_actual
+        cov_rate = cover_hits / tn * 100 if tn > 0 else 0
         print(f"  合計 {tn} 根  MAE={np.mean(close_errs):.2f}%  "
               f"MAX={np.max(close_errs):.2f}%  "
-              f"方向命中={dir_correct}/{tn} ({dir_correct/tn*100:.0f}%)")
+              f"方向命中={dir_correct}/{tn} ({dir_correct/tn*100:.0f}%)  "
+              f"覆蓋率(P10-P90)={cov_rate:.1f}%")
     print(sep + "\n")
 
 
@@ -685,7 +895,7 @@ def parse_args():
     p.add_argument("--symbol",              required=True)
     p.add_argument("--theta",               required=True)
     p.add_argument("--end-date",            default=None)
-    p.add_argument("--total-bars",          type=int,   default=30)
+    p.add_argument("--total-bars",          type=int,   default=20)
     p.add_argument("--step",                type=int,   default=5)
     p.add_argument("--lookback",            type=int,   default=120)
     p.add_argument("--n-paths",             type=int,   default=500)
@@ -694,8 +904,9 @@ def parse_args():
     p.add_argument("--garch-model",         default="gjr-garch",
                    choices=["gjr-garch", "garch"])
     p.add_argument("--auto-calibrate",      action="store_true", default=True)
-    p.add_argument("--param-model",         default=None,
-                   help="joblib 模型路徑，覆蓋 drift_scale / drift_decay")
+    p.add_argument("--param-model",         default=None)
+    p.add_argument("--agent-profile",       default=None,
+                   help="agent_profile.json 路徑，提供散戶/大戶行為參數")
     p.add_argument("--output-dir",          default="results")
     p.add_argument("--verbose",             action="store_true")
     p.add_argument("--short-drift-weight",  type=float, default=0.4)
@@ -725,7 +936,8 @@ def main():
         theta = CalibratedTheta.from_dict(json.load(f))
 
     param_model_payload = load_param_model(getattr(args, "param_model", None))
-    label_suffix = "param-model" if param_model_payload is not None else ""
+    agent_profile       = load_agent_profile(getattr(args, "agent_profile", None))
+    label_suffix = "agent+medoid" if agent_profile is not None else "medoid"
 
     end_dt   = pd.Timestamp(args.end_date) if args.end_date else pd.Timestamp.today()
     start_dt = end_dt - pd.DateOffset(years=3)
@@ -763,7 +975,7 @@ def main():
     end_date_str = end_dt.strftime("%Y-%m-%d")
     print(f"\n[rolling_forward]  {args.symbol}  起點={end_date_str}  "
           f"step={args.step}  total={args.total_bars}  "
-          f"dynamic_drift={args.dynamic_drift}  "
+          f"agent={'ON' if agent_profile else 'OFF'}  "
           f"param_model={'ON' if param_model_payload else 'OFF'}")
 
     result = rolling_forward(
@@ -773,6 +985,7 @@ def main():
         args=args,
         actual_future_df=actual_future_df,
         param_model_payload=param_model_payload,
+        agent_profile=agent_profile,
     )
 
     print_rolling_comparison(
@@ -793,47 +1006,46 @@ def main():
         label_suffix=label_suffix,
     )
 
-    # 儲存 JSON
     out_path = Path(args.output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     summary = {
-        "symbol":        args.symbol,
-        "end_date":      end_date_str,
-        "step":          args.step,
-        "total_bars":    args.total_bars,
-        "start_price":   round(start_price, 4),
-        "param_model":   str(args.param_model) if args.param_model else None,
-        "round_details": result["round_details"],
-        "dynamic_drift": args.dynamic_drift,
+        "symbol":         args.symbol,
+        "end_date":       end_date_str,
+        "step":           args.step,
+        "total_bars":     args.total_bars,
+        "start_price":    round(start_price, 4),
+        "param_model":    str(args.param_model) if args.param_model else None,
+        "agent_profile":  str(args.agent_profile) if args.agent_profile else None,
+        "round_details":  result["round_details"],
+        "dynamic_drift":  args.dynamic_drift,
         "dir_definition": "sign(pred-prev_actual)==sign(actual-prev_actual)",
+        "path_selection": "medoid",
     }
 
     if result["actual_closes"] is not None:
         pred   = result["pred_closes"]
         actual = result["actual_closes"]
         prev_a = result["actual_prev_closes"]
+        p10_a  = result["p10"]
+        p90_a  = result["p90"]
         na     = min(len(pred), len(actual), len(prev_a))
 
         mae = float(np.mean(
             np.abs(pred[:na] - actual[:na]) / start_price * 100
         ))
 
-        p_rets = np.array([
-            pred[i] - prev_a[i]
-            for i in range(na)
-            if prev_a[i] is not None
-        ])
-        a_rets = np.array([
-            actual[i] - prev_a[i]
-            for i in range(na)
-            if prev_a[i] is not None
-        ])
+        p_rets = np.array([pred[i] - prev_a[i] for i in range(na) if prev_a[i] is not None])
+        a_rets = np.array([actual[i] - prev_a[i] for i in range(na) if prev_a[i] is not None])
         valid_n = len(p_rets)
         dirs    = int(np.sum(np.sign(p_rets) == np.sign(a_rets)))
 
-        summary["overall_mae_pct"]  = round(mae, 4)
-        summary["dir_accuracy_pct"] = round(dirs / valid_n * 100, 2) if valid_n > 0 else None
-        print(f"\n  整體 MAE={mae:.2f}%   方向命中={dirs}/{valid_n} ({dirs/valid_n*100:.0f}%)")
+        coverage = float(compute_coverage(actual[:na], p10_a[:na], p90_a[:na]))
+
+        summary["overall_mae_pct"]   = round(mae, 4)
+        summary["dir_accuracy_pct"]  = round(dirs / valid_n * 100, 2) if valid_n > 0 else None
+        summary["coverage_p10_p90"]  = round(coverage * 100, 2)
+        print(f"\n  整體 MAE={mae:.2f}%   方向命中={dirs}/{valid_n} ({dirs/valid_n*100:.0f}%)  "
+              f"覆蓋率(P10-P90)={coverage*100:.1f}%")
 
     suffix_file = f"_{label_suffix}" if label_suffix else ""
     json_path = out_path / f"{args.symbol}_{end_date_str}_rolling{args.step}{suffix_file}.json"
